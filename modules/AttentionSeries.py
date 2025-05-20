@@ -8,6 +8,7 @@ from einops import rearrange
 from .rope import apply_rope, Rope2DPosEmb
 from typing import Optional, Tuple, Callable
 from .RMSNorm import RMSNorm
+from transformers.activations import ACT2FN
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -168,6 +169,91 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+
+class GatedAttention(nn.Module):
+    """
+    基于门控注意力的多实例学习聚合模块。
+    """
+    def __init__(self, input_dim: int, num_classes: int, intermediate_dim: int = 512, hidden_dim_att: int = 256, hidden_act="silu"):
+        """
+        初始化 GatedAttentionMIL 模块。
+
+        Args:
+            input_dim_vit (int): ViT输出的patch特征的维度。  512
+            num_classes (int): 分类任务的类别数量。  3
+            hidden_dim_att (int): 门控注意力网络中隐藏层的维度。默认为 384。
+            mapped_dim_fc (int): 初始特征映射层输出的维度。默认为 512。
+        """
+        super().__init__()
+        self.input_dim = input_dim
+        self.num_classes = num_classes
+        self.intermediate_dim = intermediate_dim
+        self.hidden_dim_att = hidden_dim_att
+
+        if hidden_act not in ACT2FN:
+            raise ValueError(f"Unsupported activation function: {hidden_act}. Supported: {list(ACT2FN.keys())}")
+        self.act_fn = ACT2FN[hidden_act]
+        # 1. 全连接层和ReLU，将输入patch特征映射到 intermediate_dim 维
+        self.feature_mapper = nn.Sequential(
+            nn.Linear(self.input_dim, self.intermediate_dim),
+            self.act_fn
+        )
+
+        # 2. 门控注意力网络
+        self.attention_V = nn.Linear(self.intermediate_dim, self.hidden_dim_att)
+        self.attention_U = nn.Linear(self.intermediate_dim, self.hidden_dim_att)
+        self.attention_weights = nn.Linear(self.hidden_dim_att, 1)
+
+        # 3. 全连接分类器头部
+        self.classifier = nn.Linear(self.intermediate_dim, self.num_classes)
+
+    def forward(self, patch_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        前向传播函数。
+
+        Args:
+            patch_features (torch.Tensor): 从ViT提取的patch特征。
+                                           形状: (batch_size_slides, num_patches, input_dim_vit)
+                                           这里 batch_size_slides 应该为 1，因为我们一次处理一个 slide 的所有 patch。
+                                           或者，如果 batch_size_slides > 1, 需要确保注意力在每个 slide 内部独立计算。
+                                           当前实现假设 batch_size_slides = 1 或注意力在整个批次上计算。
+                                           为了严格的 MIL，通常 batch_size_slides=1。
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]:
+                - logits (torch.Tensor): 分类 logits。形状: (batch_size_slides, num_classes)
+                - att_softmax (torch.Tensor): 计算出的注意力权重。形状: (batch_size_slides, num_patches, 1)
+        """
+        # patch_features: (B_slides, N_patches, D_vit)
+        
+        # 1. 映射特征
+        # mapped_features: (B_slides, N_patches, D_mapped)
+        mapped_features = self.feature_mapper(patch_features)
+
+        # 2. 计算门控注意力
+        # att_v: (B_slides, N_patches, D_hidden_att)
+        att_v = torch.tanh(self.attention_V(mapped_features))
+        # att_u: (B_slides, N_patches, D_hidden_att)
+        att_u = torch.sigmoid(self.attention_U(mapped_features))
+
+        # A_raw: (B_slides, N_patches, 1) - 每个patch的原始注意力分数
+        A_raw = self.attention_weights(att_v * att_u)
+        # att_softmax: (B_slides, N_patches, 1) - 对每个slide内的patch应用softmax
+        # 如果 B_slides > 1, 这里的 softmax 是在所有 N_patches 上进行的，
+        # 如果希望在每个 slide 内部的 N_patches 上独立 softmax，需要调整。
+        # 假设当前我们一次处理一个 slide (B_slides=1)，或者注意力在所有 patch 上计算。
+        att_softmax = F.softmax(A_raw, dim=1) # dim=1 表示在 num_patches 维度上 softmax
+
+        # 3. 聚合得到slide级别的嵌入
+        # slide_embedding: (B_slides, D_mapped)
+        slide_embedding = torch.sum(att_softmax * mapped_features, dim=1)
+
+        # 4. 分类
+        # logits: (B_slides, num_classes)
+        logits = self.classifier(slide_embedding)
+
+        return logits, att_softmax
+    
 
 class EncoderSelfAttention(nn.Module):
 

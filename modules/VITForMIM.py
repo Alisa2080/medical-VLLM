@@ -39,7 +39,7 @@ def apply_layer_wise_scaling(model, decay_factor=0.9):
 
 class VisionTransformerForMaskedImageModeling(nn.Module):
     def __init__(self, 
-                 dim:int=768,
+                 dim:int=512,
                  img_size:int = 384, 
                  patch_size:int=16,
                  in_chans:int=3,
@@ -214,6 +214,7 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
                 output_hidden_states: bool = False,
                 return_patch_tokens=False, 
                 return_all_tokens=False,
+                return_cls_feature: bool = False,
                 **kwargs):
         output_attentions = output_attentions if output_attentions is not None else False
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
@@ -236,6 +237,10 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
         if return_patch_tokens:
             return patch_tokens
 
+        if return_cls_feature:
+            # Return the [CLS] token embedding after all blocks and final normalization
+            return last_hidden_states[:, 0, :] # Shape: (B, C)
+        
         if return_all_tokens:
             return last_hidden_states
         else:

@@ -1,42 +1,59 @@
 import math
 import torch
 import torch.nn as nn
-from modules.Block import Block
+from modules.Block import Block,EncoderBlock
 from modules.PatchEmbed import PatchEmbed,PatchEmbed_PT
+from typing import Optional, Tuple,Callable
 from modules.VITForMIM import VisionTransformerForMaskedImageModeling
 from modules.RMSNorm import RMSNorm
 
 
-
 class VisionTransformerForMaskedImageModelingCLS(VisionTransformerForMaskedImageModeling):
-    def __init__(self, img_size=384, patch_size=16, in_chans=3, vocab_size=8192, embed_dim=768, depth=12,
-                 num_heads=12, mlp_ratio=4., qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=RMSNorm, init_values=None, attn_head_dim=None,
-                 use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False, init_std=0.02,
-                 early_layers=6, head_layers=2, shared_lm_head=True):
-        super().__init__(img_size=img_size, patch_size=patch_size, in_chans=in_chans, vocab_size=vocab_size, embed_dim=embed_dim, depth=depth,
-                 num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
-                 drop_path_rate=drop_path_rate, norm_layer=norm_layer, init_values=init_values, attn_head_dim=attn_head_dim,
-                 use_abs_pos_emb=use_abs_pos_emb, use_rel_pos_bias=use_rel_pos_bias, use_shared_rel_pos_bias=use_shared_rel_pos_bias, init_std=init_std)
+    def __init__(self, 
+                 dim:int=512,
+                 img_size:int = 384, 
+                 patch_size:int=16,
+                 in_chans:int=3,
+                 vocab_size:int=8192,
+                 depth:int=12,
+                 num_heads:int=12,
+                 num_kv_heads: int = None,
+                 mlp_ratio:float=4.,
+                 qkv_bias:bool=False,
+                 qk_scale:Optional[float]=None,
+                 attn_drop_rate:float=0.,
+                 drop_path_rate:float=0.,
+                 norm_layer:Callable=RMSNorm,
+                 norm_eps: float = 1e-6,
+                 hidden_act: str = "silu",
+                 init_std: float = 0.02,
+                 layer_scale_init_values: Optional[float] =  1e-5,
+                 rope_base: int = 10000,
+                 early_layers: int = 6,
+                 head_layers: int = 2, 
+                 shared_lm_head: bool = True,
+                 ):
+        super().__init__(img_size=img_size, patch_size=patch_size, in_chans=in_chans, vocab_size=vocab_size, dim=dim, depth=depth,
+                 num_heads=num_heads, num_kv_heads=num_kv_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop_rate=attn_drop_rate,
+                 drop_path_rate=drop_path_rate, norm_layer=norm_layer, norm_eps=norm_eps,  hidden_act=hidden_act, rope_base=rope_base,
+                 init_std=init_std, layer_scale_init_values=layer_scale_init_values)
 
         self.early_layers = early_layers
         print(f'early layer {early_layers}, late layer {depth - early_layers}, condenser head layers {head_layers}, shared_lm_head {shared_lm_head}')
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, max(depth, early_layers + head_layers))]  # stochastic depth decay rule
         self.cls_pt_layers = nn.ModuleList([
-            Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                init_values=init_values, window_size=self.patch_embed.patch_shape if use_rel_pos_bias else None,
-                attn_head_dim=attn_head_dim,
+            EncoderBlock(
+                dim=dim, num_heads=num_heads, num_kv_heads=num_kv_heads,mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,norm_eps=norm_eps, hidden_act=hidden_act,
             )
             for i in range(early_layers, early_layers + head_layers)])
         self.fix_init_cls_pt_weight()
 
         self.shared_lm_head = shared_lm_head
         if not shared_lm_head:
-            self.cls_pt_norm = norm_layer(embed_dim)
-            self.cls_pt_lm_head = nn.Linear(embed_dim, vocab_size)
+            self.cls_pt_norm = norm_layer(dim,eps=norm_eps if norm_eps else 1e-6)
+            self.cls_pt_lm_head = nn.Linear(dim, vocab_size, bias=False)
 
             self.cls_pt_norm.apply(self._init_weights)
             self.cls_pt_lm_head.apply(self._init_weights)
@@ -49,8 +66,12 @@ class VisionTransformerForMaskedImageModelingCLS(VisionTransformerForMaskedImage
             rescale(layer.attn.proj.weight.data, self.early_layers + layer_id + 1)
             rescale(layer.mlp.fc2.weight.data, self.early_layers + layer_id + 1)
 
-    def forward_features(self, x, bool_masked_pos):
-        x = self.patch_embed(x, bool_masked_pos=bool_masked_pos)
+    def forward_features(self, 
+                         image_tensor: torch.Tensor, 
+                         bool_masked_pos: torch.Tensor,
+                         **kwargs
+                         ):
+        x = self.patch_embed(image_tensor, bool_masked_pos=bool_masked_pos)
         batch_size, seq_len, _ = x.size()
 
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
