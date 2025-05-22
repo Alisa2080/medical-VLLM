@@ -174,7 +174,13 @@ class GatedAttention(nn.Module):
     """
     基于门控注意力的多实例学习聚合模块。
     """
-    def __init__(self, input_dim: int, num_classes: int, intermediate_dim: int = 512, hidden_dim_att: int = 256, hidden_act="silu"):
+    def __init__(self, 
+                 input_dim: int,
+                   num_classes: int, 
+                   intermediate_dim: int = 512, 
+                   hidden_dim_att: int = 256, 
+                   hidden_act="silu",
+                   init_std: float = 0.02):
         """
         初始化 GatedAttentionMIL 模块。
 
@@ -189,6 +195,7 @@ class GatedAttention(nn.Module):
         self.num_classes = num_classes
         self.intermediate_dim = intermediate_dim
         self.hidden_dim_att = hidden_dim_att
+        self.init_std = init_std
 
         if hidden_act not in ACT2FN:
             raise ValueError(f"Unsupported activation function: {hidden_act}. Supported: {list(ACT2FN.keys())}")
@@ -206,24 +213,16 @@ class GatedAttention(nn.Module):
 
         # 3. 全连接分类器头部
         self.classifier = nn.Linear(self.intermediate_dim, self.num_classes)
+        self.apply(self.init_weights)
+
+    def init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.trunc_normal_(m.weight, std=self.init_std) # 使用和ViT类似的截断正态初始化
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
 
     def forward(self, patch_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        前向传播函数。
-
-        Args:
-            patch_features (torch.Tensor): 从ViT提取的patch特征。
-                                           形状: (batch_size_slides, num_patches, input_dim_vit)
-                                           这里 batch_size_slides 应该为 1，因为我们一次处理一个 slide 的所有 patch。
-                                           或者，如果 batch_size_slides > 1, 需要确保注意力在每个 slide 内部独立计算。
-                                           当前实现假设 batch_size_slides = 1 或注意力在整个批次上计算。
-                                           为了严格的 MIL，通常 batch_size_slides=1。
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]:
-                - logits (torch.Tensor): 分类 logits。形状: (batch_size_slides, num_classes)
-                - att_softmax (torch.Tensor): 计算出的注意力权重。形状: (batch_size_slides, num_patches, 1)
-        """
         # patch_features: (B_slides, N_patches, D_vit)
         
         # 1. 映射特征

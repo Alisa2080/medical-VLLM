@@ -35,7 +35,7 @@ def segment(WSI_object, seg_params = None, filter_params = None, mask_file = Non
 
 
 def seg_and_patch(source, save_dir, patch_save_dir, mask_save_dir, stitch_save_dir, 
-				  patch_size = 224, step_size = 224, 
+				  patch_size = 384, step_size = 384, 
 				  seg_params = {'seg_level': 1, 'sthresh': 8, 'mthresh': 7, 'close': 4, 'use_otsu': False,
 				  'keep_ids': 'none', 'exclude_ids': 'none'},
 				  filter_params = {'a_t':100, 'a_h': 16, 'max_n_holes':8}, 
@@ -180,7 +180,13 @@ def seg_and_patch(source, save_dir, patch_save_dir, mask_save_dir, stitch_save_d
 
 		df.loc[idx, 'vis_level'] = current_vis_params['vis_level']
 		df.loc[idx, 'seg_level'] = current_seg_params['seg_level']
-
+		print(f"INFO: For slide {slide_id}, final seg_level to be used: {current_seg_params['seg_level']}")
+		
+		w, h = WSI_object.level_dim[current_seg_params['seg_level']]
+		if w * h > 1e8: # <--- 这里进行判断并打印错误信息
+			print('level_dim {} x {} is likely too large for successful segmentation, aborting'.format(w, h))
+			df.loc[idx, 'status'] = 'failed_seg'
+			continue # 跳过这个WSI的处理
 
 		seg_time_elapsed = -1
 		if seg:
@@ -190,7 +196,6 @@ def seg_and_patch(source, save_dir, patch_save_dir, mask_save_dir, stitch_save_d
 				print(f"Error during segmentation for {slide_id}: {e_seg}")
 				df.loc[idx, 'status'] = 'failed_seg'
 				continue
-
 
 		if save_mask:
 			try:
@@ -296,7 +301,7 @@ if __name__ == '__main__':
 		if key not in ['source']:
 			os.makedirs(val, exist_ok=True)
 
-	seg_params = {'seg_level': 1, 'sthresh': 8, 'mthresh': 7, 'close': 4, 'use_otsu': False,
+	seg_params = {'seg_level':1, 'sthresh': 8, 'mthresh': 7, 'close': 4, 'use_otsu': False,
 				  'keep_ids': 'none', 'exclude_ids': 'none'}
 	filter_params = {'a_t':100, 'a_h': 16, 'max_n_holes':8}
 	vis_params = {'vis_level': -1, 'line_thickness': 250}
