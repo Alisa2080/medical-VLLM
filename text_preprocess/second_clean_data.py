@@ -151,7 +151,7 @@ OUTPUT_CLEANED_JSON_DIR = r'F:\dataset\medical_text_json\version3' # 使用新�
 
 API_CALL_DELAY = 0.5
 
-SYSTEM_PROMPT = """你是一位专业的文本编辑和数据清洗专家，尤其擅长处理医学科研文献。
+SYSTEM_PROMPT =   """你是一位专业的文本编辑和数据清洗专家，尤其擅长处理医学科研文献。
 你的任务是仔细审查并优化用户提供的从科研论文中提取的文本片段。
 请严格按照以下规则操作：
 1.  主要目标是提高文本作为语言模型训练数据的质量。

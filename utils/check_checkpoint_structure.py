@@ -77,7 +77,7 @@ def inspect_checkpoint(checkpoint_path):
 
 if __name__ == '__main__':
     # 将下面的路径替换为你的 last.ckpt 文件的实际路径
-    ckpt_path = r"E:\article_code\output\beit2\checkpoints\version_3\last.ckpt" 
+    ckpt_path = r"E:\article_code\output\beit2\finetuning_pl\mil_checkpoints\version_0\last.ckpt" 
     # 或者如果你在Linux/macOS上：
     # ckpt_path = "/path/to/your/last.ckpt"
     

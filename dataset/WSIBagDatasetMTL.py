@@ -154,4 +154,3 @@ class SinglePatchDataset(Dataset):
             return img
         except Exception as e:
             print(f"Error loading patch {patch_path}: {e}")
-            return self.transform(Image.new('RGB', (224, 224))) # Return a dummy if error, or handle better
