@@ -39,7 +39,6 @@ def apply_layer_wise_scaling(model, decay_factor=0.9):
             if hasattr(block, 'mlp') and hasattr(block.mlp, 'fc2'):
                 block.mlp.fc2.weight.mul_(scale)
 
-
 class VisionTransformerForMaskedImageModeling(nn.Module):
     def __init__(self, 
                  dim:int=512,

@@ -14,7 +14,7 @@ from pathlib import Path
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 # Your custom modules
 
-from dataset.WSIDataModule import WSIDataModule
+from datasets.vision_datasets.WSIDataModule import WSIDataModule
 from model.VIT_CLassifer import ViTClassifier, MILFineTuningModule 
 
 PngImagePlugin.MAX_TEXT_CHUNK = 100 * (1024 ** 2)
@@ -157,7 +157,7 @@ def main(args):
         print(f"Using Smart WSI Data Module with sampling strategy: {args.sampling_strategy}")
         
         # 导入SmartWSIDataModule
-        from dataset.WSIDataModule_Smart import SmartWSIDataModule
+        from datasets.vision_datasets.WSIDataModule_Smart import SmartWSIDataModule
 
         data_module = SmartWSIDataModule(
             data_csv=args.data_csv,

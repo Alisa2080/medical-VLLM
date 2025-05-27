@@ -1,11 +1,13 @@
 import torch.nn as nn
 import torch
+import warnings
 import torch.nn.functional as F
 from timm.layers import trunc_normal_
+from transformers.cache_utils import Cache, DynamicCache
 from typing import Optional, Tuple
 import numpy as np
 from einops import rearrange
-from .rope import apply_rope, Rope2DPosEmb
+from .rope import apply_rope, Rope2DPosEmb,apply_rotary_pos_emb,apply_rotary_pos_emb_qwen3,rotate_half
 from typing import Optional, Tuple, Callable
 from .RMSNorm import RMSNorm
 from transformers.activations import ACT2FN
@@ -254,7 +256,7 @@ class GatedAttention(nn.Module):
         return logits, att_softmax
     
 
-class EncoderSelfAttention(nn.Module):
+class VisionEncoderSelfAttention(nn.Module):
 
     def __init__(
             self,
@@ -348,6 +350,359 @@ class EncoderSelfAttention(nn.Module):
 
         return attn_output, attn_weights
 
+class EncoderSelfAttention(nn.Module):
+
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int = 12,
+            num_kv_heads: Optional[int] = 4, # Changed default to None for clarity
+            qkv_bias: bool = False,
+            qk_scale: Optional[float] = None,
+            attn_drop: float = 0.,
+            norm_layer: Callable = RMSNorm,
+            norm_eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        assert self.num_heads % self.num_kv_heads == 0, \
+            f"num_heads ({self.num_heads}) must be divisible by num_kv_heads ({self.num_kv_heads})"
+       
+
+        self.attention_dropout = attn_drop
+        self.num_groups = self.num_heads // self.num_kv_heads
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.head_dim = dim // num_heads 
+        self.scale = qk_scale or self.head_dim ** -0.5
+        self.q_proj = nn.Linear(dim, self.num_heads * self.head_dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, self.num_kv_heads * self.head_dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, self.num_kv_heads * self.head_dim, bias=qkv_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, dim, bias=qkv_bias)
+
+        self.q_norm = norm_layer(self.head_dim, eps=norm_eps)
+        self.k_norm = norm_layer(self.head_dim, eps=norm_eps)
+
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        # --- RoPE related arguments ---
+        N_text: Optional[int] = None, # 表示文本 token 的数量。当输入包含文本和图像的组合时，用于指定文本部分的长度。
+        cos: Optional[torch.Tensor] = None, # 可选的余弦张量，用于 RoPE
+        sin: Optional[torch.Tensor] = None, # 可选的正弦张量，用于 RoPE
+        rope_2d_instance: Optional[Rope2DPosEmb] = None, # 用于 2D RoPE。
+        image_pos_ids: Optional[torch.Tensor] = None, # 可选的图像位置 ID 张量，形状为 (B, N_img)，其中 N_img 是图像 token 的数量。
+        grid_hw: Optional[Tuple[int, int]] = None,
+        **kwargs 
+    ):
+       
+        input_shape = hidden_states.shape[:-1] # B, sequence length
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+ 
+        # 3. Apply RoPE if applicable
+        is_text_only = (cos is not None) and (rope_2d_instance is None)
+        is_image_only = (cos is None) and (rope_2d_instance is not None)
+        is_combined = (cos is not None) and (rope_2d_instance is not None)
+
+        if is_text_only:
+            query_states, key_states = apply_rotary_pos_emb_qwen3(
+                query_states, key_states, cos, sin, unsqueeze_dim=1 # Check unsqueeze_dim based on shape (B, N, H, D) -> needs 2
+            )
+        elif is_image_only:
+            assert rope_2d_instance is not None and image_pos_ids is not None and grid_hw is not None, "2D RoPE args needed"
+            N_img = input_shape[1] # N_img = sequence length
+            # --- Apply 2D RoPE (Image Only) ---
+            q_cls, q_patches = query_states[:, :, :1, :], query_states[:, :, 1:, :] # (B, 1, H, D), (B, P, H, D) P=N_img-1
+            k_cls, k_patches = key_states[:, :, :1, :], key_states[:, :, 1:, :] # (B, 1, Hkv, D), (B, P, Hkv, D)
+
+            patch_rel_pos_ids = image_pos_ids[:, 1:]
+            h_indices = (patch_rel_pos_ids // grid_hw[1]) % grid_hw[0] # (B, P)
+            w_indices = patch_rel_pos_ids % grid_hw[1]                 # (B, P)
+            patch_2d_pos_idx = torch.stack([h_indices, w_indices], dim=-1) # (B, P, 2)
+            patch_mask = torch.ones(patch_2d_pos_idx.shape[:-1], dtype=torch.bool, device=hidden_states.device) # (B, P)
+
+            try:
+                freqs_cis_patches = rope_2d_instance.get_freqs_cis_by_idx(patch_2d_pos_idx, patch_mask) # (B, P, head_dim/2)
+                q_r, k_r = apply_rope(q_patches.transpose(1, 2), k_patches.transpose(1, 2), freqs_cis_patches)
+                
+                # Transpose back: (B, P, H, D) -> (B, H, P, D)
+                q_patches_rot = q_r.transpose(1, 2)
+                k_patches_rot = k_r.transpose(1, 2)
+            except IndexError as e:
+                 print(f"Warning: IndexError during 2D RoPE application. Check pos_idx and max H/W. Error: {e}")
+
+            query_states = torch.cat([q_cls, q_patches_rot], dim=2) # Concatenate along sequence dimension
+            key_states = torch.cat([k_cls, k_patches_rot], dim=2) 
+
+        elif is_combined:
+            assert N_text is not None and \
+                   rope_2d_instance is not None and image_pos_ids is not None and grid_hw is not None, "All RoPE args needed for combined input"
+
+            # Text part
+            q_text = query_states[:, :, :N_text, :]
+            k_text = key_states[:, :, :N_text, :]
+            q_text_rot, k_text_rot = apply_rotary_pos_emb_qwen3(
+                q_text, k_text, cos, sin, unsqueeze_dim=1
+            )
+
+            q_img_all = query_states[:, :, N_text:, :] # Includes CLS at index 0
+            k_img_all = key_states[:, :, N_text:, :] # Includes CLS at index 0
+
+            q_img_cls, q_img_patches = q_img_all[:, :, :1, :], q_img_all[:, :, 1:, :] # (B, 1, H, D), (B, P, H, D) P=N_img-1
+            k_img_cls, k_img_patches = k_img_all[:, :, :1, :], k_img_all[:, :, 1:, :] # (B, 1, Hkv, D), (B, P, Hkv, D)
+
+            patch_rel_pos_ids = image_pos_ids[:, 1:]
+            h_indices = (patch_rel_pos_ids // grid_hw[1]) % grid_hw[0] # (B, P)
+            w_indices = patch_rel_pos_ids % grid_hw[1]                 # (B, P)
+            patch_2d_pos_idx = torch.stack([h_indices, w_indices], dim=-1) # (B, P, 2)
+            patch_mask = torch.ones(patch_2d_pos_idx.shape[:-1], dtype=torch.bool, device=hidden_states.device) # (B, P)
+
+            q_img_patches_rot, k_img_patches_rot = q_img_patches, k_img_patches # Default if error
+            try:
+                freqs_cis_patches = rope_2d_instance.get_freqs_cis_by_idx(patch_2d_pos_idx, patch_mask) # (B, P, head_dim/2)
+                
+                q_r, k_r = apply_rope(q_img_patches.transpose(1, 2), k_img_patches.transpose(1, 2), freqs_cis_patches)
+
+                q_img_patches_rot = q_r.transpose(1, 2)
+                k_img_patches_rot = k_r.transpose(1, 2)
+            except IndexError as e:
+                 print(f"Warning: IndexError during 2D RoPE application. Check pos_idx and max H/W. Error: {e}")
+
+
+            q_img_final = torch.cat([q_img_cls, q_img_patches_rot], dim=2)
+            k_img_final = torch.cat([k_img_cls, k_img_patches_rot], dim=2)
+
+            query_states = torch.cat([q_text_rot, q_img_final], dim=2)
+            key_states = torch.cat([k_text_rot, k_img_final], dim=2)
+        
+        attn_mask_for_eager = None
+        if attention_mask is not None:
+           if attention_mask.dtype == torch.bool:
+               attn_mask_for_eager = torch.zeros_like(attention_mask, dtype=query_states.dtype)
+               attn_mask_for_eager.masked_fill_(~attention_mask, torch.finfo(query_states.dtype).min)
+           else:
+               attn_mask_for_eager = attention_mask
+
+        attention_interface: Callable = eager_attention_forward
+
+        attn_output, attn_weights = attention_interface(
+            self,        
+            query=query_states,            
+            key=key_states,              
+            value=value_states,            
+            attention_mask=attn_mask_for_eager, 
+            scaling=self.scale,
+            dropout=self.attention_dropout,
+        )   
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, attn_weights
+    
+class DecoderCrossAttention(nn.Module):
+    """
+    基于 GQA 和 RoPE 的多头注意力模块，强制应用因果掩码。
+    专为自回归解码器设计。继承自 AttentionGQA_ROPE 的结构和 RoPE 功能。
+
+    Args:
+        dim (int): 输入特征维度。
+        num_heads (int): 查询 (Q) 注意力头的数量。
+        num_kv_heads (Optional[int]): 键 (K) 和值 (V) 注意力头的数量。如果为 None，则等于 num_heads (MHA)。
+        qkv_bias (bool): 是否为 Q, K, V 投影添加偏置。
+        qk_scale (Optional[float]): QK 点积的缩放因子。默认为 head_dim ** -0.5。
+        attn_drop (float): Attention Map 上的 Dropout 概率。
+    """
+    def __init__(
+            self,
+            dim: int, # Decoder 维度 (Query dim)
+            num_heads: int = 12,
+            context_dim: Optional[int] = None, # Encoder 输出维度 (Key/Value dim)
+            num_kv_heads: Optional[int] = 4,
+            qkv_bias: bool = False,
+            qk_scale: Optional[float] = None,
+            attn_drop: float = 0.,
+            layer_idx: Optional[int] = None,
+            norm_layer = RMSNorm,
+            norm_eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.context_dim = context_dim if context_dim is not None else dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        assert self.num_heads % self.num_kv_heads == 0, \
+            f"num_heads ({self.num_heads}) must be divisible by num_kv_heads ({self.num_kv_heads})"
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.head_dim = dim // num_heads # 32
+        self.kv_head_dim = self.context_dim // self.num_kv_heads  # 64
+        self.layer_idx = layer_idx
+        self.scale = qk_scale or self.head_dim ** -0.5
+        self.attention_dropout = attn_drop
+        
+        # 恒等映射
+        self.q_proj = nn.Linear(dim, self.num_heads * self.head_dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(context_dim, self.num_kv_heads * self.head_dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(context_dim, self.num_kv_heads * self.head_dim, bias=qkv_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, dim)
+
+        self.q_norm = norm_layer(self.head_dim, eps=norm_eps)
+        self.k_norm = norm_layer(self.head_dim, eps=norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor, # Decoder 输入 (B, Nq, C_q)
+        context: Optional[torch.Tensor] = None,  # Encoder 输出 (B, Nkv, C_kv)
+        context_mask: Optional[torch.Tensor] = None, # Context mask (0/-inf format)
+        cos: Optional[torch.Tensor] = None, # Pre-selected RoPE cos for query
+        sin: Optional[torch.Tensor] = None,
+        **kwargs, 
+        # past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        # use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        decoder_input_shape = hidden_states.shape[:-1]  # B, sequence length
+        decoder_hidden_shape = (*decoder_input_shape, -1, self.head_dim) # B, S, -1, head_dim
+        
+        if context is not None:
+            encoder_output_shape = context.shape[:-1] # B, sequence length
+            encoder_hidden_shape = (*encoder_output_shape, -1, self.head_dim) # B, S, -1, head_dim
+        else:
+            warnings.warn("encoder_output is None, using hidden_states for both Q and KV.")
+        query_states = self.q_norm(self.q_proj(hidden_states).view(decoder_hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(context).view(encoder_hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(context).view(encoder_hidden_shape).transpose(1, 2)
+
+
+        if cos is not None and sin is not None:
+            # K (key_states) from context does not get RoPE
+            cos_q = cos.unsqueeze(1)
+            sin_q = sin.unsqueeze(1)
+            query_states = (query_states * cos_q) + (rotate_half(query_states) * sin_q)
+            # We discard the rotated key_states as we don't apply RoPE to context keys
+
+        if context_mask is not None:
+            # context_mask: True 表示有效, False 表示应被屏蔽
+            # 我们希望 attn_mask_for_eager 在应被屏蔽的位置为 -inf, 其他位置为 0
+            if context_mask.dtype == torch.bool:
+                attn_mask_for_eager = torch.zeros_like(context_mask, dtype=query_states.dtype)
+                attn_mask_for_eager.masked_fill_(~context_mask, torch.finfo(query_states.dtype).min)
+            else:
+                # 假设已经是 0/-inf 格式
+                attn_mask_for_eager = context_mask
+        
+        attention_interface: Callable = eager_attention_forward
+        attn_output, attn_weights = attention_interface(
+            self,                      # Pass module instance
+            query=query_states,        # Query (B, H, Nq, Dq)
+            key=key_states,            # Key from context (B, Hkv, Nkv, Dkv)
+            value=value_states,        # Value from context (B, Hkv, Nkv, Dkv)
+            attention_mask=attn_mask_for_eager, # Use the context mask (0/-inf)
+            scaling=self.scale,
+            dropout=self.attention_dropout, # Pass float probability
+        )
+
+        attn_output = attn_output.reshape(*decoder_input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+
+
+        return attn_output, attn_weights
+
+class DecoderSelfAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 12,
+        num_kv_heads: Optional[int] = 4,
+        qkv_bias: bool = False,
+        qk_scale: Optional[float] = None,
+        attn_drop: float = 0.,
+        layer_idx: Optional[int] = None,
+        norm_layer = RMSNorm,
+        norm_eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        
+        assert self.num_heads % self.num_kv_heads == 0
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.head_dim = dim // num_heads
+        self.is_causal = True
+        self.attention_dropout = attn_drop
+        self.layer_idx = layer_idx
+        if self.layer_idx is None:
+            print("Warning: layer_idx not provided to DecoderSelfAttention. KV Caching will not work correctly.")
+
+        self.scale = qk_scale or self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(dim, self.num_heads * self.head_dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, self.num_kv_heads * self.head_dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, self.num_kv_heads * self.head_dim, bias=qkv_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, dim, bias=qkv_bias)
+
+        self.q_norm = norm_layer(self.head_dim, eps=norm_eps)
+        self.k_norm = norm_layer(self.head_dim, eps=norm_eps)
+
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None, # 4D Causal Mask, True means mask -> 需要转为 0/-inf
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        use_cache: bool = False,
+        **kwargs, # 其他参数
+    ) -> torch.Tensor:
+        input_shape = hidden_states.shape[:-1]  # B, sequence length
+        hidden_shape = (*input_shape, -1, self.head_dim) # B, N, num_heads, head_dim
+
+
+        # Batch_size,num_head,Sen_len,head_dim
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        
+        # 4. Apply RoPE
+        if cos is not None and sin is not None:
+             query_states, key_states = apply_rotary_pos_emb_qwen3(query_states,key_states, cos, sin, unsqueeze_dim=1)
+
+        # 5. Handle KV Cache
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx , cache_kwargs)
+        
+        if attention_mask is not None:
+            if attention_mask.dtype == torch.bool:
+                attn_mask_for_eager = torch.zeros_like(attention_mask, dtype=query_states.dtype)
+                attn_mask_for_eager.masked_fill_(~attention_mask, torch.finfo(query_states.dtype).min)
+
+            else:
+                attn_mask_for_eager = attention_mask
+                
+        attention_interface: Callable = eager_attention_forward
+
+
+
+        # 调用核心计算函数
+        attn_output, attn_weights = attention_interface(
+            self,        
+            query=query_states,            
+            key=key_states,              
+            value=value_states,            
+            attention_mask=attn_mask_for_eager, 
+            scaling=self.scale,
+            dropout=self.attention_dropout,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, attn_weights   # attn_output:(batch,sen_len,dim), attn_weights:(batch, num_heads, sen_len, sen_len)
 
 class P2TAttention(nn.Module):
     def __init__(self, dim, num_heads=2, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.,

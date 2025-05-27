@@ -11,9 +11,7 @@ from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models import register_model
 
 from modules.VisionTransformer import VisionTransformer
-from norm_ema_quantizer import NormEMAVectorQuantizer
-from modules.teachermodel_image_preprocess import ScalingLayerForClip, ScalingLayerForIM
-import utils
+from modules.norm_ema_quantizer import NormEMAVectorQuantizer
 
 
 class VQKD(nn.Module):
