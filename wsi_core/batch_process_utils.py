@@ -50,7 +50,15 @@ def initialize_df(slides, seg_params, filter_params, vis_params, patch_params,
 
 		# patching params
 		'use_padding': np.full((total), bool(patch_params['use_padding']), dtype=bool),
-		'contour_fn': np.full((total), patch_params['contour_fn'])
+		'contour_fn': np.full((total), patch_params['contour_fn']),
+		
+		# 新增自适应参数相关字段
+        'recommended_patch_level': np.full((total), -1, dtype=np.int8),
+        'recommended_step_size': np.full((total), -1, dtype=np.int32),
+        'expected_patches': np.full((total), -1, dtype=np.int32),
+        'actual_patches': np.full((total), -1, dtype=np.int32),
+        'actual_mpp': np.full((total), -1.0, dtype=np.float32),
+        'actual_physical_size': np.full((total), -1.0, dtype=np.float32)
 		})
 
 	if save_patches:

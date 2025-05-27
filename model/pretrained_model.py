@@ -65,7 +65,6 @@ def beit_base_patch16_384_8k_vocab_used(pretrained=False, **kwargs):
         patch_size=16, dim=512, depth=6, num_heads=8, num_kv_heads=4, mlp_ratio=4, qkv_bias=False,
         norm_layer=RMSNorm, eps=1e-6, attn_drop_rate=0.01, drop_path_rate=0.0, hidden_act="silu", layer_scale_init_values=0.1, vocab_size=kwargs.get('vocab_size', 8192),
         rope_base=10000, init_std=0.02, **kwargs)
-    apply_layer_wise_scaling(model, decay_factor=0.9)
 
     model.default_cfg = cfg()
     model.default_cfg['input_size'] = (3, 384, 384)

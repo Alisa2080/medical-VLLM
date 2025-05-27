@@ -24,7 +24,7 @@ import json
 
 try:
     from apex.optimizers import FusedNovoGrad, FusedAdam, FusedLAMB, FusedSGD
-    has_apex = Trueset
+    has_apex = True
 except ImportError:
     has_apex = False
 
@@ -34,6 +34,12 @@ def get_num_layer_for_vit(var_name, num_max_layer):
         return 0
     elif var_name.startswith("patch_embed"):
         return 0
+    elif var_name.startswith("rope2d"):
+        return 0
+    elif var_name.startswith("lm_head"):
+        return num_max_layer - 1
+    elif var_name.startswith("norm"):  # 新增：最终归一化层
+        return num_max_layer - 1
     elif var_name.startswith("rel_pos_bias"): # For BEiT v1 style, BEiT v2 might not have this or handle differently
         return num_max_layer - 1
     elif var_name.startswith("blocks"):
@@ -65,9 +71,13 @@ def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), layer_decay_rat
     if num_layers is None: # num_layers should be the max_layer_id for which decay applies
         raise ValueError("num_layers must be provided for layer_wise_lr_decay.")
     
-    num_effective_layers_for_decay = num_layers + 1 # embeds + blocks
-    lr_scales = [layer_decay_rate ** (num_effective_layers_for_decay - 1 - i) for i in range(num_effective_layers_for_decay)]
-    assigner = LayerDecayValueAssigner(lr_scales)
+    if layer_decay_rate is not None and layer_decay_rate < 1.0:
+        num_effective_layers_for_decay = num_layers + 1
+        lr_scales = [layer_decay_rate ** (num_effective_layers_for_decay - 1 - i) 
+                    for i in range(num_effective_layers_for_decay)]
+        assigner = LayerDecayValueAssigner(lr_scales)
+    else:
+        assigner = None
     
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -80,9 +90,13 @@ def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), layer_decay_rat
                     flag = True
             if flag:
                 continue
-        if param.ndim <= 1 or name.endswith(".bias") or name in skip_list: # param.ndim <= 1 len(param.shape) == 1
+        if (param.ndim <= 1 or 
+            name.endswith(".bias") or 
+            name in skip_list or
+            "norm" in name.lower() or  # 归一化层通常不衰减
+            "rope" in name.lower()): 
             group_name = "no_decay"
-            this_weight_decay = 0.
+            this_weight_decay = 0.0
         else:
             group_name = "decay"
             this_weight_decay = weight_decay

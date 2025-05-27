@@ -15,7 +15,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from dataset.datasets import build_beit_pretraining_dataset
 from modules.VITForMIM import BEiTLightningModule
-import utils
+from utils.utils import bool_flag
 import model.pretrained_model
 import model.vqkd_model
 
@@ -28,9 +28,9 @@ def get_args():
     parser = argparse.ArgumentParser('BEiT pre-training script', add_help=False)
     # 默认的命令行参数
     parser.add_argument('--batch_size', default=64, type=int)
-    parser.add_argument('--epochs', default=300, type=int)
-    parser.add_argument('--save_ckpt_freq', default=20, type=int)
-    parser.add_argument('--tokenizer_weight', type=str,default= r"/gz-data/beit2/image_tokenizer.pth")
+    parser.add_argument('--epochs', default=30, type=int)
+    parser.add_argument('--save_ckpt_freq', default=10, type=int)
+    parser.add_argument('--tokenizer_weight', type=str,default= r"/gz-data/image_tokenizer.pth")
     parser.add_argument('--tokenizer_model', type=str, default="vqkd_encoder_base_decoder_3x768x12_clip")
     parser.add_argument('--model', default='beit_base_patch16_384_8k_vocab_used', type=str)
 
@@ -50,7 +50,7 @@ def get_args():
     # cls-pretraining settings
     parser.add_argument('--early_layers', default=9, type=int, help='early_layers, default 9 for base and 21 for large')
     parser.add_argument('--head_layers', default=2, type=int, help='head_layers')
-    parser.add_argument('--shared_lm_head', default=True, type=utils.bool_flag, help='head_layers')
+    parser.add_argument('--shared_lm_head', default=True, type=bool_flag, help='head_layers')
 
     # Tokenizer parameters
     parser.add_argument('--codebook_size', default=8192, type=int, help='number of codebook')
@@ -90,7 +90,7 @@ def get_args():
     parser.add_argument('--grad_accum_steps', type=int, default=1, 
                         help='Number of steps to accumulate gradients (default: 1)')
     # Augmentation parameters
-    parser.add_argument('--decoupling_aug', default=False, type=utils.bool_flag, help="use decoupling aug for tokenizer and vit")
+    parser.add_argument('--decoupling_aug', default=False, type=bool_flag, help="use decoupling aug for tokenizer and vit")
     parser.add_argument('--color_jitter', type=float, default=0.4, metavar='PCT',
                         help='Color jitter factor (default: 0.4)')
     parser.add_argument('--train_interpolation', type=str, default='bicubic',
@@ -101,7 +101,7 @@ def get_args():
                         help='min_crop_scale (default: 0.08)')
     
     # Dataset parameters
-    parser.add_argument('--data_path', default=r'/gz-data/patchset', type=str,
+    parser.add_argument('--data_path', default=r'/gz-data/patches', type=str,
                         help='dataset path')
     parser.add_argument('--eval_data_path', default='', type=str, help='dataset path')
     parser.add_argument('--data_set', default='image_folder',  type=str, help='dataset path')
@@ -198,9 +198,7 @@ def get_visual_tokenizer(args):
 def main(args):
 
     print(args)
-
     cudnn.benchmark = True
-
     # 根据命令行参数创建模型
     model = get_model(args)
     patch_size = model.patch_embed.patch_size
@@ -212,11 +210,14 @@ def main(args):
 
     vqkd = get_visual_tokenizer(args)
 
-    num_gpus_estimate = torch.cuda.device_count() if args.device == "cuda" and torch.cuda.is_available() else 1
-    num_training_steps_per_epoch = len(dataset_train) // (args.batch_size * num_gpus_estimate * args.grad_accum_steps)
-    if num_training_steps_per_epoch == 0 and len(dataset_train) > 0: # Handle small datasets
-        num_training_steps_per_epoch = 1
+    if args.device == "cuda" and torch.cuda.is_available():
+        num_gpus_estimate = torch.cuda.device_count()
+        print(f"Detected {num_gpus_estimate} GPUs")
+    else:
+        num_gpus_estimate = 1
+        print("Using CPU or single device")
 
+        # 创建数据加载器
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train,
         batch_size=args.batch_size,
@@ -224,11 +225,19 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True,
         persistent_workers=True if args.num_workers > 0 else False,
+        shuffle=True,  # 确保数据被打乱
     )
-
+    total_batch_size = args.batch_size * num_gpus_estimate * args.grad_accum_steps
     num_training_steps_per_epoch = len(data_loader_train) // args.grad_accum_steps
-    if num_training_steps_per_epoch == 0 and len(data_loader_train) > 0 :
+    
+    if num_training_steps_per_epoch == 0: # Handle small datasets
         num_training_steps_per_epoch = 1
+        print("Warning: Very small dataset detected, setting num_training_steps_per_epoch=1")
+    
+    print(f"Dataset size: {len(dataset_train)}")
+    print(f"Batch size per GPU: {args.batch_size}")
+    print(f"Total batch size: {total_batch_size}")
+    print(f"Number of training steps per epoch: {num_training_steps_per_epoch}")
 
     lightning_module = BEiTLightningModule(
         model=model,
@@ -241,7 +250,7 @@ def main(args):
         warmup_lr=args.warmup_lr,
         optimizer_name=args.opt,
         opt_eps=args.opt_eps,
-        opt_betas=tuple(args.opt_betas) if args.opt_betas else (0.9, 0.95), 
+        opt_betas=list(args.opt_betas) if args.opt_betas else [0.9, 0.95], 
         num_training_steps_per_epoch=num_training_steps_per_epoch,
         weight_decay_end=args.weight_decay_end,
         momentum=args.momentum if 'sgd' in args.opt or 'momentum' in args.opt else None,
@@ -278,29 +287,28 @@ def main(args):
     if args.resume: # Explicitly provided checkpoint
         ckpt_path = args.resume
     elif args.auto_resume:
-        # Try to find 'last.ckpt' in the *latest* version directory if output_dir and log_dir are set
-        if args.output_dir and args.log_dir:
-            log_root = Path(args.log_dir) / "lightning_logs"
-            if log_root.exists():
-                versions = sorted([d for d in log_root.iterdir() if d.is_dir() and d.name.startswith("version_")],
-                                  key=lambda p: int(p.name.split("_")[-1]), reverse=True)
-                if versions:
-                    latest_version_dir = versions[0]
-                    last_ckpt_path = latest_version_dir / "checkpoints" / "last.ckpt"
-                    if last_ckpt_path.exists():
-                        ckpt_path = str(last_ckpt_path)
-                        print(f"Auto-resuming from latest version's last.ckpt: {ckpt_path}")
+        # 在当前输出目录中查找最新的检查点
+        if args.output_dir:
+            ckpt_dir = os.path.join(args.output_dir, "checkpoints")
+            if os.path.exists(ckpt_dir):
+                # 查找所有version目录
+                version_dirs = [d for d in os.listdir(ckpt_dir) if d.startswith("version_")]
+                if version_dirs:
+                    # 按版本号排序，获取最新的
+                    latest_version = sorted(version_dirs, key=lambda x: int(x.split("_")[1]))[-1]
+                    last_ckpt = os.path.join(ckpt_dir, latest_version, "last.ckpt")
+                    if os.path.exists(last_ckpt):
+                        ckpt_path = last_ckpt
+                        print(f"Auto-resuming from: {ckpt_path}")
                     else:
-                        print(f"Auto-resume: Found latest version dir {latest_version_dir}, but no last.ckpt found there.")
+                        print(f"No last.ckpt found in {os.path.join(ckpt_dir, latest_version)}")
                 else:
-                    print("Auto-resume: No versioned log directories found to resume from.")
+                    print("No version directories found for auto-resume")
             else:
-                print(f"Auto-resume: Log directory {log_root} does not exist.")
-        else:
-            print("Auto-resume: --output_dir and --log_dir must be set to find the latest checkpoint.")
-
+                print(f"Checkpoint directory {ckpt_dir} does not exist")
+    
     if ckpt_path and not os.path.exists(ckpt_path):
-        print(f"Warning: Checkpoint path {ckpt_path} provided for resume does not exist. Starting from scratch.")
+        print(f"Warning: Checkpoint {ckpt_path} does not exist, starting from scratch")
         ckpt_path = None
 
     trainer = pl.Trainer(
@@ -314,6 +322,9 @@ def main(args):
         gradient_clip_val=args.clip_grad if args.clip_grad > 0 else None,
         log_every_n_steps=min(50, num_training_steps_per_epoch) if num_training_steps_per_epoch > 0 else 1,
         gradient_clip_algorithm="norm",
+        val_check_interval=None,  # 禁用验证
+        enable_progress_bar=True,
+        enable_model_summary=True,
     )
 
     print(f"Starting training with PyTorch Lightning for {args.epochs} epochs...")
@@ -337,9 +348,4 @@ if __name__ == '__main__':
 
     if args.log_dir:
         Path(args.log_dir).mkdir(parents=True, exist_ok=True)
-
-    start_time = time.time()
     main(args)
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print(f'Total script execution time: {total_time_str}')

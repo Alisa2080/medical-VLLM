@@ -64,16 +64,19 @@ class Rope2DPosEmb(nn.Module):
     """
 
     def __init__(
-        self, dim: int, max_height: int, max_width: int, theta_base=10000, device="cuda"
-    ):
+        self, dim: int, max_height: int, max_width: int, theta_base=10000):
         super().__init__()
         self.dim = dim
         assert self.dim % 4 == 0, "dim must be divisible by 4"
         self.max_height = max_height
         self.max_width = max_width
         self.theta_base = theta_base
-        self.device = device
+        self.register_buffer('_dummy', torch.tensor(0.0), persistent=False)
 
+    @property
+    def device(self):
+        return self._dummy.device
+    
     def extra_repr(self):
         return f"dim={self.dim}, max_height={self.max_height}, max_width={self.max_width}, theta_base={self.theta_base}"
 

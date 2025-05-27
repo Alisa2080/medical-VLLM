@@ -76,7 +76,7 @@ class DataAugmentationForBEiT(object):
                 )
             ], p=0.8),
             RandStainNA(
-                yaml_file=r"/gz-data/beit2/RandStainNA/CRC_LAB_randomTrue_n0.yaml",
+                yaml_file=r"/gz-data/Vision_Encoder/RandStainNA/CRC_LAB_randomTrue_n0.yaml",
                 std_hyper=-0.3,
                 probability=1.0,
                 distribution="normal",
@@ -116,10 +116,13 @@ class DataAugmentationForBEiT(object):
         else:
             for_patches = result
             for_visual_tokens = result # 当 common_transform 返回单个图像时，两路使用相同的图像
+        mask_2d = self.masked_position_generator()  # (H, W)
+        mask_1d = mask_2d.flatten()  # (H*W,)
+        
         return (
             self.patch_transform(for_patches),
             self.visual_token_transform(for_visual_tokens),
-            self.masked_position_generator()
+            mask_1d,
         )
 
     def __repr__(self):

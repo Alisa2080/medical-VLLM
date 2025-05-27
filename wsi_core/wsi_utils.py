@@ -7,7 +7,308 @@ from PIL import Image
 import math
 import cv2
 from tqdm import tqdm
+import openslide
+from typing import Tuple, Optional, Dict, Any
+import math
 
+class WSIAdaptiveParameterEngine:
+    """
+    WSI自适应参数推荐引擎
+    根据WSI特性智能推荐patch_level和step_size
+    """
+    
+    def __init__(self, 
+                 target_patch_mpp: float = 0.75,
+                 target_patch_physical_size: Optional[int] = None,
+                 min_patches_target: int = 300,
+                 max_patches_target: int = 2500,
+                 default_wsi_mpp: float = 0.25,
+                 min_step_size_ratio: float = 0.25,
+                 max_iterations: int = 5):
+        """
+        初始化参数推荐引擎
+        
+        Args:
+            target_patch_mpp: 目标patch的MPP值（微米/像素）
+            target_patch_physical_size: 目标patch覆盖的物理尺寸（微米）
+            min_patches_target: 目标最小patch数量
+            max_patches_target: 目标最大patch数量
+            default_wsi_mpp: 默认WSI的MPP值
+            min_step_size_ratio: step_size相对于patch_size的最小比例
+            max_iterations: 参数调整的最大迭代次数
+        """
+        self.target_patch_mpp = target_patch_mpp
+        self.target_patch_physical_size = target_patch_physical_size
+        self.min_patches_target = min_patches_target
+        self.max_patches_target = max_patches_target
+        self.default_wsi_mpp = default_wsi_mpp
+        self.min_step_size_ratio = min_step_size_ratio
+        self.max_iterations = max_iterations
+    
+    def get_wsi_mpp(self, wsi_object) -> float:
+        """获取WSI的MPP值"""
+        try:
+            wsi = wsi_object.getOpenSlide()
+            mpp_x = wsi.properties.get(openslide.PROPERTY_NAME_MPP_X)
+            mpp_y = wsi.properties.get(openslide.PROPERTY_NAME_MPP_Y)
+            
+            if mpp_x is not None and mpp_y is not None:
+                return (float(mpp_x) + float(mpp_y)) / 2.0
+            else:
+                print(f"Warning: MPP not found in WSI properties. Using default MPP: {self.default_wsi_mpp}")
+                return self.default_wsi_mpp
+        except Exception as e:
+            print(f"Warning: Error reading MPP from WSI: {e}. Using default MPP: {self.default_wsi_mpp}")
+            return self.default_wsi_mpp
+    
+    def estimate_tissue_area(self, wsi_object, seg_level: int = None) -> Tuple[float, int]:
+        """
+        估算组织区域面积
+        
+        Returns:
+            Tuple[float, int]: (level0坐标系下的组织面积, 使用的seg_level)
+        """
+        wsi = wsi_object.getOpenSlide()
+        
+        # 选择合适的分割层级
+        if seg_level is None:
+            seg_level = wsi.get_best_level_for_downsample(64)
+        
+        # 快速组织分割
+        try:
+            img = np.array(wsi.read_region((0, 0), seg_level, wsi_object.level_dim[seg_level]))
+            img_hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+            img_med = cv2.medianBlur(img_hsv[:, :, 1], 7)
+            _, img_otsu = cv2.threshold(img_med, 8, 255, cv2.THRESH_BINARY)
+            
+            # 查找轮廓
+            contours, hierarchy = cv2.findContours(img_otsu, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+            
+            if len(contours) == 0:
+                return 0.0, seg_level
+            
+            # 计算组织面积（在seg_level坐标系下）
+            tissue_area_seg_level = 0
+            hierarchy = np.squeeze(hierarchy, axis=(0,))[:, 2:] if hierarchy is not None else None
+            
+            if hierarchy is not None:
+                # 找到前景轮廓（parent == -1）
+                foreground_indices = np.flatnonzero(hierarchy[:, 1] == -1)
+                for cont_idx in foreground_indices:
+                    cont = contours[cont_idx]
+                    area = cv2.contourArea(cont)
+                    if area > 100:  # 过滤小的伪影
+                        # 减去孔洞面积
+                        holes = np.flatnonzero(hierarchy[:, 1] == cont_idx)
+                        hole_areas = sum(cv2.contourArea(contours[hole_idx]) for hole_idx in holes)
+                        tissue_area_seg_level += (area - hole_areas)
+            else:
+                # 简单情况：没有层次结构
+                tissue_area_seg_level = sum(cv2.contourArea(cont) for cont in contours if cv2.contourArea(cont) > 100)
+            
+            # 转换到level 0坐标系
+            scale = wsi_object.level_downsamples[seg_level]
+            tissue_area_level0 = tissue_area_seg_level * scale[0] * scale[1]
+            
+            return tissue_area_level0, seg_level
+            
+        except Exception as e:
+            print(f"Warning: Error estimating tissue area: {e}")
+            # 返回一个保守估计
+            w, h = wsi_object.level_dim[0]
+            return w * h * 0.3, seg_level  # 假设30%是组织
+    
+    def recommend_patch_level(self, wsi_object, patch_size: int, wsi_mpp: float) -> int:
+        """
+        推荐最佳patch_level
+        
+        Args:
+            wsi_object: WSI对象
+            patch_size: patch尺寸（像素）
+            wsi_mpp: WSI的MPP值
+        
+        Returns:
+            推荐的patch_level
+        """
+        available_levels = len(wsi_object.level_dim)
+        wsi = wsi_object.getOpenSlide()
+        
+        best_level = 0
+        best_score = float('inf')
+        
+        for level in range(available_levels):
+            downsample = wsi_object.level_downsamples[level]
+            level_mpp = wsi_mpp * downsample[0]  # 该层级的MPP
+            
+            # 策略1: 基于目标MPP
+            if self.target_patch_mpp is not None:
+                mpp_score = abs(level_mpp - self.target_patch_mpp)
+            else:
+                mpp_score = 0
+            
+            # 策略2: 基于目标物理尺寸
+            if self.target_patch_physical_size is not None:
+                physical_size = patch_size * level_mpp
+                physical_size_score = abs(physical_size - self.target_patch_physical_size) / self.target_patch_physical_size
+            else:
+                physical_size_score = 0
+            
+            # 策略3: 避免过高或过低分辨率
+            w, h = wsi_object.level_dim[level]
+            if w * h < 1000 * 1000:  # 太小的层级
+                resolution_penalty = 2.0
+            elif w * h > 50000 * 50000:  # 太大的层级
+                resolution_penalty = 1.0
+            else:
+                resolution_penalty = 0
+            
+            # 综合评分
+            total_score = mpp_score + physical_size_score + resolution_penalty
+            
+            if total_score < best_score:
+                best_score = total_score
+                best_level = level
+        
+        print(f"Recommended patch_level: {best_level} (MPP: {wsi_mpp * wsi_object.level_downsamples[best_level][0]:.3f})")
+        return best_level
+    
+    def recommend_step_size(self, wsi_object, patch_level: int, patch_size: int, tissue_area_level0: float) -> Tuple[int, int]:
+        """
+        推荐最佳step_size
+        
+        Args:
+            wsi_object: WSI对象
+            patch_level: patch层级
+            patch_size: patch尺寸
+            tissue_area_level0: level0坐标系下的组织面积
+        
+        Returns:
+            Tuple[int, int]: (推荐的step_size, 调整后的patch_level)
+        """
+        current_patch_level = patch_level
+        
+        for iteration in range(self.max_iterations):
+            # 计算当前层级下的组织面积
+            downsample = wsi_object.level_downsamples[current_patch_level]
+            tissue_area_current_level = tissue_area_level0 / (downsample[0] * downsample[1])
+            
+            # 估算patch数量（假设step_size = patch_size）
+            estimated_patches = tissue_area_current_level / (patch_size * patch_size)
+            
+            print(f"Iteration {iteration + 1}: patch_level={current_patch_level}, estimated_patches={estimated_patches:.0f}")
+            
+            # 检查patch数量是否在目标范围内
+            if self.min_patches_target <= estimated_patches <= self.max_patches_target:
+                # 数量合适，使用默认step_size
+                step_size = patch_size
+                print(f"Patch count in target range. Using step_size = patch_size = {step_size}")
+                return step_size, current_patch_level
+            
+            elif estimated_patches < self.min_patches_target:
+                # patch太少，需要增加重叠或降低patch_level
+                if iteration < self.max_iterations - 1 and current_patch_level > 0:
+                    # 尝试降低patch_level（提高分辨率）
+                    current_patch_level -= 1
+                    print(f"Too few patches. Reducing patch_level to {current_patch_level}")
+                    continue
+                else:
+                    # 增加重叠
+                    target_ratio = self.min_patches_target / estimated_patches
+                    step_size_ratio = 1.0 / math.sqrt(target_ratio)
+                    step_size_ratio = max(step_size_ratio, self.min_step_size_ratio)
+                    step_size = max(int(patch_size * step_size_ratio), int(patch_size * self.min_step_size_ratio))
+                    print(f"Increasing overlap. Using step_size = {step_size}")
+                    return step_size, current_patch_level
+            
+            else:  # estimated_patches > max_patches_target
+                # patch太多，需要减少重叠或提高patch_level
+                if iteration < self.max_iterations - 1 and current_patch_level < len(wsi_object.level_dim) - 1:
+                    # 尝试提高patch_level（降低分辨率）
+                    current_patch_level += 1
+                    print(f"Too many patches. Increasing patch_level to {current_patch_level}")
+                    continue
+                else:
+                    # 减少重叠（step_size = patch_size已经是最大值）
+                    step_size = patch_size
+                    print(f"Using maximum step_size = {step_size} (no overlap)")
+                    return step_size, current_patch_level
+        
+        # 如果迭代结束仍未找到最优解，返回保守设置
+        step_size = patch_size
+        print(f"Max iterations reached. Using step_size = {step_size}")
+        return step_size, current_patch_level
+    
+    def recommend_parameters(self, wsi_object, patch_size: int, user_patch_level: Optional[int] = None, user_step_size: Optional[int] = None) -> Dict[str, Any]:
+        """
+        为WSI推荐最佳参数
+        
+        Args:
+            wsi_object: WSI对象
+            patch_size: patch尺寸
+            user_patch_level: 用户指定的patch_level（如果提供则不调整）
+            user_step_size: 用户指定的step_size（如果提供则不调整）
+        
+        Returns:
+            推荐参数字典
+        """
+        print(f"\n=== Analyzing WSI: {wsi_object.name} ===")
+        
+        # 获取WSI基础信息
+        wsi_mpp = self.get_wsi_mpp(wsi_object)
+        tissue_area_level0, seg_level_used = self.estimate_tissue_area(wsi_object)
+        
+        print(f"WSI MPP: {wsi_mpp:.3f} µm/pixel")
+        print(f"Estimated tissue area: {tissue_area_level0:.0f} pixels² (level 0)")
+        print(f"Segmentation performed at level: {seg_level_used}")
+        
+        # 推荐patch_level
+        if user_patch_level is not None:
+            recommended_patch_level = user_patch_level
+            print(f"Using user-specified patch_level: {recommended_patch_level}")
+        else:
+            recommended_patch_level = self.recommend_patch_level(wsi_object, patch_size, wsi_mpp)
+        
+        # 推荐step_size
+        if user_step_size is not None:
+            recommended_step_size = user_step_size
+            print(f"Using user-specified step_size: {recommended_step_size}")
+        else:
+            recommended_step_size, recommended_patch_level = self.recommend_step_size(
+                wsi_object, recommended_patch_level, patch_size, tissue_area_level0
+            )
+        
+        # 计算最终预期的patch数量
+        downsample = wsi_object.level_downsamples[recommended_patch_level]
+        tissue_area_patch_level = tissue_area_level0 / (downsample[0] * downsample[1])
+        expected_patches = tissue_area_patch_level / (recommended_step_size * recommended_step_size)
+        
+        # 计算实际的MPP和物理覆盖范围
+        actual_mpp = wsi_mpp * downsample[0]
+        actual_physical_size = patch_size * actual_mpp
+        
+        result = {
+            'patch_level': recommended_patch_level,
+            'step_size': recommended_step_size,
+            'expected_patches': int(expected_patches),
+            'actual_mpp': actual_mpp,
+            'actual_physical_size': actual_physical_size,
+            'tissue_area_level0': tissue_area_level0,
+            'wsi_mpp': wsi_mpp,
+            'recommendations_applied': {
+                'patch_level_adjusted': user_patch_level is None,
+                'step_size_adjusted': user_step_size is None
+            }
+        }
+        
+        print(f"\n=== Recommended Parameters ===")
+        print(f"patch_level: {result['patch_level']}")
+        print(f"step_size: {result['step_size']}")
+        print(f"Expected patches: {result['expected_patches']}")
+        print(f"Actual patch MPP: {result['actual_mpp']:.3f} µm/pixel")
+        print(f"Actual physical coverage: {result['actual_physical_size']:.1f} µm x {result['actual_physical_size']:.1f} µm")
+        print("=" * 40)
+        
+        return result
 def isWhitePatch(patch, satThresh=5):
     patch_hsv = cv2.cvtColor(patch, cv2.COLOR_RGB2HSV)
     return True if np.mean(patch_hsv[:,:,1]) < satThresh else False

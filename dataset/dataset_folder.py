@@ -304,8 +304,6 @@ def pil_loader(path: str) -> Image.Image:
     返回:
         Image.Image: 转换为RGB格式的PIL图像对象。
     """
-    # 以二进制只读模式打开图像文件，避免ResourceWarning问题
-    # 参考：https://github.com/python-pillow/Pillow/issues/835
     with open(path, 'rb') as f:
         # 使用PIL的Image.open方法打开图像文件
         img = Image.open(f)

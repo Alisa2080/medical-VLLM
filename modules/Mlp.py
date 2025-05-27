@@ -20,21 +20,18 @@ class Mlp_original(nn.Module):
         x = self.drop(x)
         return x
 
-
-
-
-
 class Mlp(nn.Module):
-    def __init__(self, hidden_size, intermediate_size,hidden_act="silu"):
+    def __init__(self, hidden_size, intermediate_size, hidden_act="silu"):
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         if hidden_act not in ACT2FN:
             raise ValueError(f"Unsupported activation function: {hidden_act}. Supported: {list(ACT2FN.keys())}")
         self.act_fn = ACT2FN[hidden_act]
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        output = self.down_proj(self.act_fn(self.up_proj(hidden_states)))
-        return output
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj

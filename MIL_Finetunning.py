@@ -35,17 +35,23 @@ def get_args_parser():
     
     # Model parameters
     parser.add_argument('--model_name', default='beit_base_patch16_384_8k_vocab_used', type=str, metavar='MODEL', help='Name of model to create')
-    parser.add_argument('--pretrained_path', default=r"E:\article_code\output\beit2\checkpoints\version_3\last.ckpt", type=str, help='Path to pretrained ViT weights')
+    parser.add_argument('--pretrained_path', default=r"E:\BaiduNetdiskDownload\checkpoints\version_0\last.ckpt", type=str, help='Path to pretrained ViT weights')
     parser.add_argument('--num_classes', default=2, type=int, help='Number of classes for MIL task')
-    parser.add_argument('--embed_dim', default=None, type=int, help='ViT output embedding dimension (auto-detected if None)')
+    parser.add_argument('--embed_dim', default=512, type=int, help='ViT output embedding dimension (auto-detected if None)')
     parser.add_argument('--mil_hidden_dim_att', default=256, type=int, help='Hidden dimension for GatedAttention')
     parser.add_argument('--mil_intermediate_dim', default=384, type=int, help='Intermediate dimension for GatedAttention')
-    parser.add_argument('--freeze', action='store_true', help='Freeze ViT encoder weights')
+    parser.add_argument('--freeze', type=bool, default=False, help='Freeze ViT encoder weights')
 
+    # LDAM + DRW parameters
+    parser.add_argument('--ldam_C_factor', type=float, default=1.0, help='LDAM loss margin scaling factor')
+    parser.add_argument('--drw_start_epoch', type=int, default=None, help='Epoch to start DRW (switch to CB loss). Default: 80% of total epochs')
+    parser.add_argument('--cb_beta', type=float, default=0.999, help='Beta parameter for class-balanced loss effective number calculation')
+    
+    
     # Training parameters (PyTorch Lightning Trainer)
     parser.add_argument('--epochs', default=30, type=int, help="Max number of epochs for PyTorch Lightning Trainer")
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Gradient accumulation steps (handled by Trainer)')
-    parser.add_argument('--patch_batch_size', default=6, type=int, help='Batch size for processing patches within a WSI (in MILFineTuningModule)')
+    parser.add_argument('--patch_batch_size', default=4, type=int, help='Batch size for processing patches within a WSI (in MILFineTuningModule)')
     parser.add_argument('--output_dir', default=r"E:\article_code\output\beit2\finetuning_pl", type=str, help='Base path to save logs and checkpoints')
     parser.add_argument('--log_dir_name', default="lightning_logs", type=str, help="Name of the subdirectory for TensorBoard logs within output_dir")
     parser.add_argument('--seed', default=42, type=int)
@@ -57,7 +63,6 @@ def get_args_parser():
     parser.add_argument('--auto_resume', action='store_true', help='Automatically resume from the last checkpoint in the log directory.')
     parser.add_argument('--no_auto_resume', action='store_false', dest='auto_resume')
     parser.set_defaults(auto_resume=True)
-
 
     # Optimizer parameters (passed to MILFineTuningModule)
     parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER', help='Optimizer (default: "adamw")')
@@ -74,6 +79,20 @@ def get_args_parser():
     parser.add_argument('--warmup_lr', type=float, default=1e-6, metavar='LR', help='Warmup learning rate')
     parser.add_argument('--min_lr', type=float, default=1e-6, metavar='LR', help='Lower LR bound for scheduler')
     parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N', help='Epochs to warmup LR')
+    # 新增智能采样相关参数
+    parser.add_argument('--use_smart_sampling', action='store_true', 
+                        help='Use smart patch sampling based on quality scores')
+    parser.add_argument('--quality_scores_dir', type=str, default=r"F:\dataset\CLAM-WSI\tumor_segment\patch_score",
+                        help='Directory containing patch quality assessment results')
+    parser.add_argument('--sampling_strategy', type=str, default='hybrid',
+                        choices=['quality_based', 'stratified', 'diversity_aware', 'hybrid'],
+                        help='Patch sampling strategy for smart sampling')
+    parser.add_argument('--max_patches_per_wsi', type=int, default=1000,
+                        help='Maximum number of patches to sample per WSI')
+    parser.add_argument('--min_patches_per_wsi', type=int, default=300,
+                        help='Minimum number of patches to sample per WSI')
+    parser.add_argument('--quality_threshold', type=float, default=0.3,
+                        help='Quality threshold for patch filtering')
     return parser
 
 class GradientNormLogger(pl.Callback):
@@ -126,34 +145,76 @@ def main(args):
 
     pl.seed_everything(args.seed, workers=True)
 
-    # 1. Instantiate ViTClassifier (the nn.Module)
+    
+     # 1. 实例化数据模块
+    if args.use_smart_sampling:
+        if not args.quality_scores_dir:
+            raise ValueError("--quality_scores_dir must be provided when using smart sampling")
+        
+        if not os.path.exists(args.quality_scores_dir):
+            raise ValueError(f"Quality scores directory not found: {args.quality_scores_dir}")
+        
+        print(f"Using Smart WSI Data Module with sampling strategy: {args.sampling_strategy}")
+        
+        # 导入SmartWSIDataModule
+        from dataset.WSIDataModule_Smart import SmartWSIDataModule
+
+        data_module = SmartWSIDataModule(
+            data_csv=args.data_csv,
+            train_csv=args.train_csv,
+            val_csv=args.val_csv,
+            test_csv=args.test_csv,
+            patches_root_dir=args.patches_root_dir,
+            model_input_size=args.model_input_size,
+            train_batch_size=1,
+            val_batch_size=1,
+            num_workers=args.num_workers,
+            # Smart sampling specific parameters
+            quality_scores_dir=args.quality_scores_dir,
+            sampling_strategy=args.sampling_strategy,
+            max_patches_per_wsi=args.max_patches_per_wsi,
+            min_patches_per_wsi=args.min_patches_per_wsi,
+            quality_threshold=args.quality_threshold
+        )
+    else:
+    # 2. Instantiate WSIDataModule
+        data_module = WSIDataModule(
+            data_csv=args.data_csv,
+            train_csv=args.train_csv,
+            val_csv=args.val_csv,
+            test_csv=args.test_csv,
+            patches_root_dir=args.patches_root_dir,
+            model_input_size=args.model_input_size,
+            train_batch_size=1, # Outer DataLoader batch_size is always 1 for WSI
+            val_batch_size=1,   # Outer DataLoader batch_size is always 1 for WSI
+            num_workers=args.num_workers
+        )
+    
+    # 2. Setup数据模块并获取类别信息
+    data_module.setup('fit') 
+    class_info = data_module.get_class_info()
+    samples_per_cls = class_info['samples_per_cls']
+    num_classes = class_info['num_classes']
+    print(f"Class information: {class_info}")
+
+    # 3. 设置DRW切换点
+    if args.drw_start_epoch is None:
+        args.drw_start_epoch = int(args.epochs * 0.8)  # 默认在80%的epoch处切换
+    print(f"DRW strategy: LDAM Loss for epochs 0-{args.drw_start_epoch-1}, CB Loss for epochs {args.drw_start_epoch}-{args.epochs-1}")
+    
+
+    # 4. 实例化ViT模型
     vit_model_instance = ViTClassifier(
         model_name=args.model_name,
         pretrained_path=args.pretrained_path,
-        num_classes=args.num_classes,
+        num_classes=num_classes,
         embed_dim=args.embed_dim,
         hidden_dim_att=args.mil_hidden_dim_att,
         intermediate_dim=args.mil_intermediate_dim,
-        freeze=args.freeze # Passed to ViTClassifier's freeze flag
+        freeze=args.freeze
     )
 
-    # 2. Instantiate WSIDataModule
-    data_module = WSIDataModule(
-        data_csv=args.data_csv,
-        train_csv=args.train_csv,
-        val_csv=args.val_csv,
-        test_csv=args.test_csv,
-        patches_root_dir=args.patches_root_dir,
-        model_input_size=args.model_input_size,
-        train_batch_size=1, # Outer DataLoader batch_size is always 1 for WSI
-        val_batch_size=1,   # Outer DataLoader batch_size is always 1 for WSI
-        num_workers=args.num_workers
-    )
-    # Call setup to initialize datasets, needed for num_optimizer_steps_per_epoch
-    data_module.setup('fit') 
-    
-    # Calculate num_optimizer_steps_per_epoch
-    # This needs the train_dataloader to be available from the datamodule
+    # 5. 计算优化器步数
     try:
         num_optimizer_steps_per_epoch = len(data_module.train_dataloader()) // args.grad_accum_steps
         if num_optimizer_steps_per_epoch == 0 and len(data_module.train_dataloader()) > 0:
@@ -165,9 +226,14 @@ def main(args):
     if num_optimizer_steps_per_epoch == 0:
          print("Warning: num_optimizer_steps_per_epoch is 0. This might happen if the training dataset is empty or too small. Training might not proceed correctly.")
 
-    # 3. Instantiate MILFineTuningModule (the pl.LightningModule)
+    # 6. 实例化Lightning模块
     lightning_module = MILFineTuningModule(
         model_instance=vit_model_instance,
+        # LDAM + DRW parameters
+        samples_per_cls=samples_per_cls,
+        ldam_C_factor=args.ldam_C_factor,
+        drw_start_epoch=args.drw_start_epoch,
+        cb_beta=args.cb_beta,
         # Optimizer hparams
         opt=args.opt,
         opt_eps=args.opt_eps,
@@ -193,7 +259,7 @@ def main(args):
         num_classes=args.num_classes
     )
 
-    # 4. Configure Logger and Callbacks
+     # 7. 配置Logger和Callbacks
     tb_logger = None
     callbacks_list = []
 
@@ -224,7 +290,7 @@ def main(args):
     grad_norm_logger_groups = ['encoder.patch_embed', 'encoder.blocks', 'mil_aggregator']
     callbacks_list.append(GradientNormLogger(group_names=grad_norm_logger_groups, log_individual_layers=True))
     
-    
+     # 8. 处理checkpoint恢复
     ckpt_path_to_resume = None
     if args.resume_from_checkpoint:
         ckpt_path_to_resume = args.resume_from_checkpoint
@@ -241,6 +307,7 @@ def main(args):
             # For now, this basic auto-resume is fine.
             print(f"Auto-resume: No 'last.ckpt' found in the current run's checkpoint directory: {checkpoint_dir}. Starting fresh.")
     run_validation = data_module.val_dataloader() is not None
+    
     trainer = pl.Trainer(
         accelerator=args.accelerator,
         devices=args.devices if args.devices != "auto" else "auto",

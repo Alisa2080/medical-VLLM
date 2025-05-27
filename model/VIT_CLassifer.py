@@ -1,13 +1,16 @@
 import torch
 import argparse
+import numpy as np
 import torch.nn as nn
 from modules.VITForMIM import VisionTransformerForMaskedImageModeling 
 from modules.AttentionSeries import GatedAttention 
 from timm.models import create_model
-from typing import Optional, Tuple,Callable, Iterable
+from typing import Optional, Tuple,Callable, Iterable,List
 from model import pretrained_model
+from modules.Losses import LDAMLoss, ClassBalancedLoss,CBCrossEntropyLoss
 from PIL import Image 
 import pytorch_lightning as pl
+from sklearn.metrics import classification_report, confusion_matrix, balanced_accuracy_score
 from dataset.WSIBagDatasetMTL import WSIBagDatasetMIL, SinglePatchDataset
 from torch.utils.data import DataLoader
 from modules.optim_factory import create_optimizer, get_parameter_groups
@@ -147,7 +150,8 @@ class MILFineTuningModule(pl.LightningModule):
     def __init__(self,
                  model_instance: ViTClassifier,
                  # Optimizer hparams
-                 opt: str, opt_eps: float, 
+                 opt: str, 
+                 opt_eps: float, 
                  opt_betas: list, 
                  momentum: float,
                  # LR and WD hparams
@@ -168,6 +172,11 @@ class MILFineTuningModule(pl.LightningModule):
                  # Misc model hparams
                  freeze: bool = False,
                  num_classes: int = 2, # Passed for criterion or metrics if needed
+                 # Class imbalance handling parameters
+                 samples_per_cls: List[int] = None, 
+                 ldam_C_factor: float = 1.0,
+                 drw_start_epoch: int = 20,
+                 cb_beta: float = 0.999,
                  **kwargs): # Catches other args
         super().__init__()
         # `ignore` should include non-scalar/non-simple types that shouldn't be saved in hparams.yaml
@@ -175,8 +184,25 @@ class MILFineTuningModule(pl.LightningModule):
         self.save_hyperparameters(ignore=['model_instance'])
 
         self.model = model_instance
-        self.criterion = nn.CrossEntropyLoss()
-        
+
+        # 初始化两个损失函数
+        print(f"Initializing LDAM Loss and CB Loss with samples_per_cls: {samples_per_cls}")
+
+        # LDAM Loss for stage 1
+        self.criterion_ldam = LDAMLoss(
+            samples_per_cls=samples_per_cls,
+            num_classes=num_classes,
+            C_factor=ldam_C_factor
+        )
+        # Class-Balanced Cross-Entropy Loss for stage 2
+        self.criterion_cb_ce = CBCrossEntropyLoss(
+            samples_per_cls=samples_per_cls,
+            num_classes=num_classes,
+            beta=cb_beta
+        )
+        # 用于验证的标准交叉熵
+        self.criterion_standard = nn.CrossEntropyLoss()
+
         # Initialize transforms here as they are static per instance
         self.train_patch_transforms = WSIBagDatasetMIL.patch_transforms(
             model_input_size=self.hparams.model_input_size, is_train=True
@@ -184,7 +210,14 @@ class MILFineTuningModule(pl.LightningModule):
         self.val_patch_transforms = WSIBagDatasetMIL.patch_transforms(
             model_input_size=self.hparams.model_input_size, is_train=False
         )
-
+        self.val_predictions = []
+        self.val_targets = []
+        print(f"MILFineTuningModule initialized with:")
+        print(f"  - num_classes: {num_classes}")
+        print(f"  - drw_start_epoch: {drw_start_epoch}")
+        print(f"  - samples_per_cls: {samples_per_cls}")
+        print(f"  - Validation cache initialized: predictions={len(self.val_predictions)}, targets={len(self.val_targets)}")
+    
     def forward(self, patch_batch_iterable, device):
         return self.model(patch_batch_iterable=patch_batch_iterable, device=device)
 
@@ -224,8 +257,15 @@ class MILFineTuningModule(pl.LightningModule):
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
 
-        loss = self.criterion(logits, wsi_label)
         
+        current_epoch = self.current_epoch
+        if current_epoch < self.hparams.drw_start_epoch:
+            loss = self.criterion_ldam(logits, wsi_label)
+            loss_stage = "LDAM"
+        else:
+            loss = self.criterion_cb_ce(logits, wsi_label)
+            loss_stage = "CB_CE"
+
         preds = torch.argmax(logits, dim=1)
         acc = (preds == wsi_label).float().mean()
 
@@ -233,7 +273,12 @@ class MILFineTuningModule(pl.LightningModule):
         self.log("train_acc_step", acc, on_step=True, on_epoch=False, prog_bar=True, batch_size=1,logger=True, sync_dist=True)
         self.log("train_loss_epoch", loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=1,logger=True, sync_dist=True, reduce_fx="mean")
         self.log("train_acc_epoch", acc, on_step=False, on_epoch=True, prog_bar=False, batch_size=1,logger=True, sync_dist=True, reduce_fx="mean")
-
+        # 记录当前使用的损失函数类型
+        self.log(f"train_loss_stage/{loss_stage}", loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=1, logger=True, sync_dist=True)
+        
+        # 每个epoch记录一次当前阶段
+        if batch_idx == 0:
+            print(f"Epoch {current_epoch}: Using {loss_stage} loss (DRW switch at epoch {self.hparams.drw_start_epoch})")
         return loss
     
  
@@ -266,13 +311,119 @@ class MILFineTuningModule(pl.LightningModule):
             self.log(f"val_failed_wsi/{slide_id}", 1.0, on_epoch=True, batch_size=1, sync_dist=True)
             return None
 
-        val_loss = self.criterion(logits, wsi_label)
+        val_loss = self.criterion_standard(logits, wsi_label)
         preds = torch.argmax(logits, dim=1)
         val_acc = (preds == wsi_label).float().mean()
+        
+        self.val_predictions.append(preds.cpu())
+        self.val_targets.append(wsi_label.cpu())
 
         self.log("val_loss", val_loss, on_epoch=True, prog_bar=True, batch_size=1,sync_dist=True)
         self.log("val_acc", val_acc, on_epoch=True, prog_bar=True, batch_size=1,sync_dist=True)
         return val_loss
+    
+    def on_validation_epoch_end(self):
+        """在验证epoch结束时计算类别感知指标"""
+        if len(self.val_predictions) == 0 or len(self.val_targets) == 0:
+            print("Warning: No validation predictions or targets collected. Skipping metrics computation.")
+            self._clear_validation_cache()
+            return
+        
+        try:
+            # 合并所有预测和标签
+            all_preds = torch.cat(self.val_predictions, dim=0).numpy()
+            all_targets = torch.cat(self.val_targets, dim=0).numpy()
+                
+            # 检查是否有有效的预测和标签
+            if len(all_preds) == 0 or len(all_targets) == 0:
+                print("Warning: No valid predictions or targets found for validation metrics computation.")
+                self._clear_validation_cache()
+                return
+            
+            # 检查并修复预测值超出范围的问题
+            valid_classes = set(range(self.hparams.num_classes))
+            target_classes = set(all_targets)
+            pred_classes = set(all_preds)
+
+            # 将超出范围的预测值裁剪到有效范围内
+            all_preds = np.clip(all_preds, 0, self.hparams.num_classes - 1)
+
+            print(f"Validation metrics calculation: {len(all_preds)} predictions, {len(all_targets)} targets")
+            print(f"Valid classes range: {valid_classes}")
+            print(f"Target classes: {target_classes}")
+            print(f"Prediction classes (after clipping): {set(all_preds)}")
+            print(f"Predictions shape: {all_preds.shape}, Targets shape: {all_targets.shape}") 
+
+            # 如果目标类别超出了模型类别数，也需要处理
+            if max(all_targets) >= self.hparams.num_classes:
+                print(f"Warning: Target contains classes >= num_classes ({self.hparams.num_classes})")
+                all_targets = np.clip(all_targets, 0, self.hparams.num_classes - 1)
+
+                # 计算平衡准确率
+            balanced_acc = balanced_accuracy_score(all_targets, all_preds)
+            self.log("val_balanced_acc", balanced_acc, on_epoch=True, prog_bar=True, sync_dist=True)
+                
+            # 计算每个类别的指标
+            try:
+                labels = list(range(self.hparams.num_classes))
+                # 生成分类报告
+                report = classification_report(all_targets, all_preds, labels=labels, output_dict=True, zero_division=0)
+
+                # 记录每个类别的F1分数
+                for class_idx in range(self.hparams.num_classes):
+                    class_key = str(class_idx)
+                    if class_key in report:
+                        f1_score = report[class_key]['f1-score']
+                        precision = report[class_key]['precision']
+                        recall = report[class_key]['recall']
+                            
+                        self.log(f"val_f1_class_{class_idx}", f1_score, on_epoch=True, sync_dist=True)
+                        self.log(f"val_precision_class_{class_idx}", precision, on_epoch=True, sync_dist=True)
+                        self.log(f"val_recall_class_{class_idx}", recall, on_epoch=True, sync_dist=True)
+                    
+                    # 记录宏平均指标
+                macro_f1 = report['macro avg']['f1-score']
+                macro_precision = report['macro avg']['precision']
+                macro_recall = report['macro avg']['recall']
+                    
+                self.log("val_macro_f1", macro_f1, on_epoch=True, prog_bar=True, sync_dist=True)
+                self.log("val_macro_precision", macro_precision, on_epoch=True, sync_dist=True)
+                self.log("val_macro_recall", macro_recall, on_epoch=True, sync_dist=True)
+                    
+                # 打印详细的验证结果
+                print(f"\nValidation Results - Epoch {self.current_epoch}:")
+                print(f"Balanced Accuracy: {balanced_acc:.4f}")
+                print(f"Macro F1-Score: {macro_f1:.4f}")
+                print("\nPer-class metrics:")
+                for class_idx in range(self.hparams.num_classes):
+                    class_key = str(class_idx)
+                    if class_key in report:
+                        print(f"  Class {class_idx}: F1={report[class_key]['f1-score']:.4f}, "
+                                  f"Precision={report[class_key]['precision']:.4f}, "
+                                  f"Recall={report[class_key]['recall']:.4f}")
+                    
+                # 打印混淆矩阵
+                cm = confusion_matrix(all_targets, all_preds, labels=labels)
+                print(f"Confusion Matrix:\n{cm}")
+                    
+            except Exception as e:
+                print(f"Error computing detailed metrics: {e}")
+                    
+        except Exception as e:
+            print(f"Error computing validation metrics: {e}")
+            print(f"val_predictions length: {len(self.val_predictions)}")
+            print(f"val_targets length: {len(self.val_targets)}")
+            if len(self.val_predictions) > 0:
+                print(f"First prediction shape: {self.val_predictions[0].shape if len(self.val_predictions) > 0 else 'N/A'}")
+            if len(self.val_targets) > 0:
+                print(f"First target shape: {self.val_targets[0].shape if len(self.val_targets) > 0 else 'N/A'}")
+        # 清空存储的预测和标签
+        self._clear_validation_cache()
+
+    def _clear_validation_cache(self):
+        """清空验证缓存"""
+        self.val_predictions = []
+        self.val_targets = []
     
     def configure_optimizers(self):
         param_groups_vit = []

@@ -317,7 +317,10 @@ class EncoderSelfAttention(nn.Module):
             k_patches_rot = k_r.transpose(1, 2)
         except IndexError as e:
             print(f"Warning: IndexError during 2D RoPE application. Check pos_idx and max H/W. Error: {e}")
-
+            # 降级处理：使用原始patches
+            q_patches_rot = q_patches
+            k_patches_rot = k_patches
+        
         query_states = torch.cat([q_cls, q_patches_rot], dim=2) # Concatenate along sequence dimension
         key_states = torch.cat([k_cls, k_patches_rot], dim=2)
 

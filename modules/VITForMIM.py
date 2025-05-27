@@ -1,12 +1,15 @@
 
 import torch
 import argparse
+import math
 import torch.nn as nn
 from modules.Block import EncoderBlock
 from modules.PatchEmbed import PatchEmbed, HybridEmbed,PatchEmbed_PT
 from timm.layers import trunc_normal_ as __call_trunc_normal_
 from modules.RMSNorm import RMSNorm
 from.rope import Rope2DPosEmb
+from modules.AttentionSeries import P2TAttention
+from modules.PatchEmbed import Learnable2DInterpPosEmb
 from typing import Optional, Tuple,Callable
 import pytorch_lightning as pl
 from transformers.modeling_outputs import BaseModelOutput
@@ -55,7 +58,7 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
                  norm_layer:Callable=RMSNorm,
                  norm_eps: float = 1e-6,
                  hidden_act: str = "silu",
-                 layer_scale_init_values: Optional[float] =  1e-5,
+                 layer_scale_init_values: Optional[float] =  0.01,
                  rope_base: int = 10000,
                  init_std: float = 0.02, 
                  embed_smooth_alpha: float = 1.0,
@@ -83,6 +86,7 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
         )
         self.grid_size = self.patch_embed.grid_size
         self.num_patches = self.patch_embed.num_patches
+        self.init_std = init_std
         self.cls_token = nn.Parameter(torch.empty(1, 1, self.dim))
 
         self.mask_token = nn.Parameter(torch.empty(1, 1, self.dim))
@@ -112,7 +116,7 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
             for i in range(depth)])
         self.norm = norm_layer(dim, eps=norm_eps)
 
-        self.init_std = init_std
+
 
         self.lm_head = nn.Linear(dim, vocab_size)
         nn.init.normal_(self.cls_token, std=self.init_std)
@@ -121,29 +125,135 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
         self.apply(self.init_weights)
 
     def init_weights(self, m):
+        """改进的权重初始化方法"""
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=self.init_std)
+            # 对不同类型的线性层采用不同的初始化策略
+            if hasattr(m, '_is_output_projection'):
+                # 输出投影层使用较小的初始化
+                trunc_normal_(m.weight, std=self.init_std / math.sqrt(2 * self.depth))
+            else:
+                # 普通线性层
+                trunc_normal_(m.weight, std=self.init_std)
+            
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+                
         elif isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            # 卷积层初始化
+            if hasattr(m, '_is_patch_embed'):
+                # patch embedding 的卷积层使用特殊初始化
+                nn.init.xavier_uniform_(m.weight)
+            else:
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+                
         elif isinstance(m, (nn.LayerNorm, RMSNorm)):
+            # 归一化层初始化
             if hasattr(m, 'bias') and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
             if hasattr(m, 'weight') and m.weight is not None:
                 nn.init.constant_(m.weight, 1.0)
+                
         elif isinstance(m, nn.Embedding):
+            # 嵌入层初始化
             if m.weight is not None:
                 m.weight.data.normal_(mean=0.0, std=self.init_std)
             if m.padding_idx is not None:
                 m.weight.data[m.padding_idx].zero_()
-    
+                
+        elif isinstance(m, P2TAttention):
+            # P2TAttention 特殊初始化
+            self._init_p2t_attention(m)
+            
+        elif isinstance(m, Learnable2DInterpPosEmb):
+            # 2D 位置编码初始化
+            trunc_normal_(m.pos_embed, std=0.02)
+            
+        elif isinstance(m, EncoderBlock):
+            # EncoderBlock 特殊初始化
+            self._init_encoder_block(m)
+
+    def _init_p2t_attention(self, m: P2TAttention):
+        """初始化 P2TAttention 模块"""
+        # Q, K, V 投影层初始化
+        for module in [m.q, m.kv]:
+            if isinstance(module, nn.Sequential):
+                for layer in module:
+                    if isinstance(layer, nn.Linear):
+                        trunc_normal_(layer.weight, std=self.init_std)
+                        if layer.bias is not None:
+                            nn.init.constant_(layer.bias, 0)
+        
+        # 输出投影层使用较小的初始化
+        if hasattr(m, 'proj') and isinstance(m.proj, nn.Linear):
+            trunc_normal_(m.proj.weight, std=self.init_std / math.sqrt(2))
+            if m.proj.bias is not None:
+                nn.init.constant_(m.proj.bias, 0)
+        
+        # 深度卷积层初始化
+        for conv in m.d_convs1:
+            if isinstance(conv, nn.Conv2d):
+                nn.init.kaiming_normal_(conv.weight, mode='fan_out', nonlinearity='relu')
+                if conv.bias is not None:
+                    nn.init.constant_(conv.bias, 0)
+
+    def _init_encoder_block(self, block: EncoderBlock):
+        """初始化 EncoderBlock 模块"""
+        # 注意力模块的输出投影层标记
+        if hasattr(block.attn, 'o_proj'):
+            block.attn.o_proj._is_output_projection = True
+        
+        # MLP 的第二层（下投影层）标记
+        if hasattr(block.mlp, 'down_proj'):
+            block.mlp.down_proj._is_output_projection = True
+        elif hasattr(block.mlp, 'fc2'):
+            block.mlp.fc2._is_output_projection = True
+
+    def _init_special_modules(self):
+        """初始化特殊模块"""
+        # 1. 初始化 patch embedding 的卷积层
+        if hasattr(self.patch_embed, 'proj') and isinstance(self.patch_embed.proj, nn.Conv2d):
+            self.patch_embed.proj._is_patch_embed = True
+            
+        # 2. 初始化 LM head
+        trunc_normal_(self.lm_head.weight, std=self.init_std)
+        if self.lm_head.bias is not None:
+            nn.init.constant_(self.lm_head.bias, 0)
+        
+        # 3. 初始化 cls_token 和 mask_token (在 __init__ 中已经完成)
+        # nn.init.normal_(self.cls_token, std=self.init_std)
+        # nn.init.normal_(self.mask_token, std=self.init_std)
+        
+        # 4. 对深层模型应用特殊的输出层缩放
+        if self.depth >= 12:  # 对于深层模型
+            self._apply_deep_model_scaling()
+
+    def _apply_deep_model_scaling(self):
+        """对深层模型应用输出层权重缩放"""
+        scale_factor = 1.0 / math.sqrt(2 * self.depth)
+        
+        with torch.no_grad():
+            # 缩放每个 block 的输出投影权重
+            for block in self.blocks:
+                if hasattr(block.attn, 'o_proj'):
+                    block.attn.o_proj.weight.mul_(scale_factor)
+                elif hasattr(block.attn, 'proj'):
+                    block.attn.proj.weight.mul_(scale_factor)
+                    
+                if hasattr(block.mlp, 'down_proj'):
+                    block.mlp.down_proj.weight.mul_(scale_factor)
+                elif hasattr(block.mlp, 'fc2'):
+                    block.mlp.fc2.weight.mul_(scale_factor)
+            
+            # 缩放最终的 LM head
+            self.lm_head.weight.mul_(scale_factor)
+        
     @torch.jit.ignore
     def no_weight_decay(self):
-        no_decay = {'mask_token', 'cls_token'}
-        return no_decay
+            no_decay = {'mask_token', 'cls_token'}
+            return no_decay
 
     def get_num_layers(self):
         return len(self.blocks)
@@ -158,11 +268,12 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
         output_attentions = output_attentions if output_attentions is not None else False
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
         hidden_states = self.patch_embed(hidden_state=image_tensor) # (B, N_patches, C)
-        if self.embed_smooth_alpha < 1.0:
+        if self.embed_smooth_alpha < 1.0 and self.training:
+            smooth_factor = 1.0 - self.embed_smooth_alpha
             hidden_states = (
                 hidden_states * self.embed_smooth_alpha
-                + hidden_states.detach() * (1.0 - self.embed_smooth_alpha)
-            )
+                + hidden_states * smooth_factor * 0.1  # 保持10%的梯度流
+        )
         # 获取输入张量的批次大小和序列长度
         input_size = hidden_states.shape[:2]
 
@@ -215,18 +326,22 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
                 return_patch_tokens=False, 
                 return_all_tokens=False,
                 return_cls_feature: bool = False,
+                return_masked_tokens: bool = False,
                 **kwargs):
+        
         output_attentions = output_attentions if output_attentions is not None else False
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
 
         if bool_masked_pos is None:
             bool_masked_pos = torch.zeros((image_tensor.shape[0], self.patch_embed.num_patches), dtype=torch.bool).to(image_tensor.device)
         
+        if bool_masked_pos.dtype != torch.bool:
+            bool_masked_pos = bool_masked_pos.bool()
+        
         hidden_states = self.forward_features(image_tensor, bool_masked_pos=bool_masked_pos,
                                              output_attentions=output_attentions,
                                              output_hidden_states=output_hidden_states) # (B, N, C) N = num_patches + 1
-        last_hidden_states = hidden_states.last_hidden_state 
-        patch_tokens = last_hidden_states[:, 1:]  # 取除 cls_token 外的patch tokens, shape: [B, 576, C]
+        last_hidden_states = hidden_states.last_hidden_state   # 取除 cls_token 外的patch tokens, shape: [B, 576, C]
 
         if output_hidden_states:
             return hidden_states.hidden_states # tuple(all_hidden_states)
@@ -235,7 +350,7 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
             return hidden_states.attentions # tuple(all_block_attentions)
             
         if return_patch_tokens:
-            return patch_tokens
+            return last_hidden_states[:, 1:]
 
         if return_cls_feature:
             # Return the [CLS] token embedding after all blocks and final normalization
@@ -243,10 +358,13 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
         
         if return_all_tokens:
             return last_hidden_states
-        else:
-            masked_output = self.lm_head(patch_tokens[bool_masked_pos])
+        
+        if return_masked_tokens:
+        # 专门为训练设计的返回方式
+            patch_tokens = last_hidden_states[:, 1:]  # (B, N_patches, C)
+            masked_tokens = patch_tokens[bool_masked_pos]  # (N_masked, C)
+            masked_output = self.lm_head(masked_tokens)  # (N_masked, vocab_size)
             return masked_output
-
 
     def forward_intermediate(self, 
                              image_tensor: torch.Tensor,
@@ -304,8 +422,6 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
                                            output_hidden_states=False)
         return all_attention_tuple[-1:]  
     
-
-
     
 class BEiTLightningModule(pl.LightningModule):
     def __init__(self,
@@ -320,6 +436,7 @@ class BEiTLightningModule(pl.LightningModule):
                 optimizer_name: str = 'adamw',
                 opt_eps: Optional[float] = 1e-8,
                 opt_betas: Optional[list[float, float]] = [0.9, 0.98], # Ensure this is a list for hparams
+                layer_decay_rate: Optional[float] = None,
                 num_training_steps_per_epoch: Optional[int] = None,
                 momentum: Optional[float] = None, # Added momentum for SGD 
                 **kwargs):
@@ -328,68 +445,90 @@ class BEiTLightningModule(pl.LightningModule):
         self.save_hyperparameters(ignore=['model', 'vqkd'])
         self.model = model
         self.vqkd = vqkd.eval()
-        self.loss_fn = torch.nn.CrossEntropyLoss()
-        
+        self.loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+
         if num_training_steps_per_epoch is None:
             raise ValueError("num_training_steps_per_epoch must be provided for LR scheduler.")
-            
 
     def forward(self, x, bool_masked_pos=None, **kwargs):
-            
+
         return self.model(x, bool_masked_pos=bool_masked_pos, **kwargs)
-    
+
     def training_step(self, batch, batch_idx):
-        
+
         packed_data, _ = batch
         samples, images, bool_masked_pos = packed_data
-            
+        # 确保bool_masked_pos的形状和类型正确
+        if bool_masked_pos.dim() == 3:  # (B, H, W) -> (B, H*W)
+            bool_masked_pos = bool_masked_pos.flatten(1)
+        bool_masked_pos = bool_masked_pos.to(torch.bool)
+        
         with torch.no_grad():
             autocast_enabled = self.trainer.precision.endswith("mixed")
             with torch.amp.autocast(device_type=self.device.type,dtype=self.dtype, enabled=autocast_enabled):
                 token_ids = self.vqkd.get_codebook_indices(images)
-
-        bool_masked_pos = bool_masked_pos.flatten(1).to(torch.bool)
-        labels = token_ids[bool_masked_pos]
-    
-        outputs = self.model(samples, bool_masked_pos=bool_masked_pos)
-            
-        loss = 0
-        mlm_acc = 0.0
-    
-        if not isinstance(outputs, torch.Tensor):
+        # 验证维度匹配
+        if token_ids.shape != bool_masked_pos.shape:
             raise ValueError(
-                f"Expected model output to be a torch.Tensor for MLM, but got {type(outputs)}. "
-                "If your model is designed to return a list for MLM, "
-                "you'll need to adjust this training_step logic."
+                f"Token IDs shape {token_ids.shape} doesn't match mask shape {bool_masked_pos.shape}"
             )
         
+        outputs = self.model(samples, bool_masked_pos=bool_masked_pos,return_masked_tokens=True)
+        
+        loss, mlm_acc = self._compute_loss_and_accuracy(outputs, token_ids, bool_masked_pos)
+        
+        self._log_metrics(loss, mlm_acc, batch_idx)
+
+        return loss
+ 
+    def _compute_loss_and_accuracy(self, outputs, token_ids, bool_masked_pos):
+        """计算损失和准确率"""
+        # 获取掩码位置的标签
+        labels = token_ids[bool_masked_pos]  # (N_masked,)
+        
+        if not isinstance(outputs, torch.Tensor):
+            raise ValueError(
+                f"Expected model output to be a torch.Tensor, got {type(outputs)}"
+            )
+        
+        # 验证维度匹配
         if outputs.shape[0] != labels.shape[0]:
             raise ValueError(
-                f"Shape mismatch between outputs ({outputs.shape}) and labels ({labels.shape}). "
-                f"Number of predictions ({outputs.shape[0]}) must match number of labels ({labels.shape[0]})."
+                f"Predictions ({outputs.shape[0]}) don't match labels ({labels.shape[0]})"
             )
         
         if outputs.ndim != 2 or labels.ndim != 1:
-             raise ValueError(
-                f"Dimension mismatch. Outputs should be 2D (N, C) and labels 1D (N). "
-                f"Got outputs.ndim={outputs.ndim}, labels.ndim={labels.ndim}."
+            raise ValueError(
+                f"Invalid dimensions: outputs {outputs.shape}, labels {labels.shape}"
             )
         
+        # 计算损失
         loss = self.loss_fn(outputs, labels)
-
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"NaN or Inf detected in loss at step {self.global_step}")
-
-        mlm_acc = (outputs.max(-1)[1] == labels).float().mean()
-
-        self.log("loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("mlm_acc", mlm_acc, on_step=True, on_epoch=True, prog_bar=True)
         
-        return loss
+        # 检查损失有效性
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Invalid loss detected at step {self.global_step}: {loss}")
+            # 返回一个小的有效损失以避免训练中断
+            loss = torch.tensor(1e-6, device=loss.device, requires_grad=True)
+        
+        # 计算准确率
+        with torch.no_grad():
+            predictions = outputs.argmax(dim=-1)
+            correct = (predictions == labels).float()
+            mlm_acc = correct.mean()
+        return loss, mlm_acc
 
-    def on_train_batch_start(self, batch, batch_idx):
-        pass
-
+    def _log_metrics(self, loss, mlm_acc, batch_idx):
+        """记录训练指标"""
+        # 基础指标
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train/mlm_acc", mlm_acc, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        
+        # 每100步记录详细信息
+        if batch_idx % 100 == 0:
+            self.log("train/loss_step", loss.item(), on_step=True, prog_bar=False)
+            self.log("train/acc_step", mlm_acc.item(), on_step=True, prog_bar=False)    
 
 
     def configure_optimizers(self):
@@ -403,12 +542,13 @@ class BEiTLightningModule(pl.LightningModule):
                  num_layers_for_decay = self.model.depth
             else:
                 print("Warning: Layer decay rate is set, but cannot determine number of layers from model. LLRD might not work as expected.")
+                self.hparams.layer_decay_rate = None  # 禁用层级衰减
         
         parameter_groups_with_scale = get_parameter_groups(
             self.model,
             weight_decay=self.hparams.weight_decay,
             skip_list=skip_list,
-            layer_decay_rate=self.hparams.layer_decay_rate,
+            layer_decay_rate=getattr(self.hparams, 'layer_decay_rate', None),
             num_layers=num_layers_for_decay # Pass the number of transformer blocks
         )
 
@@ -456,7 +596,6 @@ class BEiTLightningModule(pl.LightningModule):
             scheduler_cosine = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=self.hparams.min_lr)
             scheduler = scheduler_cosine
 
-            
         return {
                 "optimizer": optimizer,
                 "lr_scheduler": {

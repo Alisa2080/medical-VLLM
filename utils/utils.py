@@ -11,11 +11,26 @@ from torchvision import transforms
 from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler, RandomSampler, SequentialSampler, sampler
 import torch.optim as optim
 import pdb
+import argparse
 import torch.nn.functional as F
 import math
 from itertools import islice
 import collections
 device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def bool_flag(s):
+    """
+    Parse boolean arguments from the command line.
+    """
+    if isinstance(s, bool):
+        return s
+    if s.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif s.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+	
 
 class SubsetSequentialSampler(Sampler):
 	"""Samples elements sequentially from a given list of indices, without replacement.

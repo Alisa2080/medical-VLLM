@@ -10,6 +10,8 @@ import argparse
 import pdb
 import pandas as pd
 from tqdm import tqdm
+from wsi_core.wsi_utils import WSIAdaptiveParameterEngine
+
 
 def stitching(file_path, wsi_object, downscale = 64):
 	start = time.time()
@@ -45,7 +47,13 @@ def seg_and_patch(source, save_dir, patch_save_dir, mask_save_dir, stitch_save_d
 				  use_default_params = False, 
 				  seg = False, save_mask = True, 
 				  stitch= False, 
-				  patch = True, auto_skip=True, process_list = None):
+				  patch = True, auto_skip=True, process_list = None,
+				  auto_adjust_params = False,
+                  target_patch_mpp = None,
+                  target_patch_physical_size = None,
+                  min_patches_target = 300,
+                  max_patches_target = 2500,
+                  default_wsi_mpp = 0.25):
 	
 
 
@@ -71,6 +79,18 @@ def seg_and_patch(source, save_dir, patch_save_dir, mask_save_dir, stitch_save_d
 		'max_n_holes': np.full((len(df)), int(filter_params['max_n_holes']), dtype=np.uint32),
 		'line_thickness': np.full((len(df)), int(vis_params['line_thickness']), dtype=np.uint32),
 		'contour_fn': np.full((len(df)), patch_params['contour_fn'])})
+
+	if auto_adjust_params:
+		param_engine = WSIAdaptiveParameterEngine(
+            target_patch_mpp=target_patch_mpp,
+            target_patch_physical_size=target_patch_physical_size,
+            min_patches_target=min_patches_target,
+            max_patches_target=max_patches_target,
+            default_wsi_mpp=default_wsi_mpp
+        )
+		print("Adaptive parameter adjustment enabled")
+	else:
+		param_engine = None
 
 	seg_times = 0.
 	patch_times = 0.
@@ -157,6 +177,7 @@ def seg_and_patch(source, save_dir, patch_save_dir, mask_save_dir, stitch_save_d
 				wsi = WSI_object.getOpenSlide()
 				best_level = wsi.get_best_level_for_downsample(64)
 				current_seg_params['seg_level'] = best_level
+		
 
 		keep_ids = str(current_seg_params['keep_ids'])
 		if keep_ids != 'none' and len(keep_ids) > 0:
@@ -173,21 +194,56 @@ def seg_and_patch(source, save_dir, patch_save_dir, mask_save_dir, stitch_save_d
 			current_seg_params['exclude_ids'] = []
 
 		w, h = WSI_object.level_dim[current_seg_params['seg_level']] 
-		if w * h > 1e8:
-			print('level_dim {} x {} is likely too large for successful segmentation, aborting'.format(w, h))
-			df.loc[idx, 'status'] = 'failed_seg'
-			continue
 
 		df.loc[idx, 'vis_level'] = current_vis_params['vis_level']
 		df.loc[idx, 'seg_level'] = current_seg_params['seg_level']
 		print(f"INFO: For slide {slide_id}, final seg_level to be used: {current_seg_params['seg_level']}")
 		
 		w, h = WSI_object.level_dim[current_seg_params['seg_level']]
-		if w * h > 1e8: # <--- 这里进行判断并打印错误信息
-			print('level_dim {} x {} is likely too large for successful segmentation, aborting'.format(w, h))
-			df.loc[idx, 'status'] = 'failed_seg'
-			continue # 跳过这个WSI的处理
-
+		
+		# 自适应参数调整
+		if auto_adjust_params and param_engine:
+			try:
+                # 检查用户是否已指定参数
+				user_patch_level = None
+				user_step_size = None
+                
+                # 如果用户明确指定了patch_level或overlap，则不调整
+				if patch_level != 0:  # 用户指定了非默认patch_level
+					user_patch_level = patch_level
+                
+                # 检查是否用户通过overlap指定了step_size
+                # 这里假设如果step_size != patch_size，说明用户有意设置
+				if step_size != patch_size:
+					user_step_size = step_size
+                
+                # 获取推荐参数
+				recommendations = param_engine.recommend_parameters(
+                    WSI_object, patch_size, user_patch_level, user_step_size
+                )
+                
+                # 应用推荐参数
+				adaptive_patch_level = recommendations['patch_level']
+				adaptive_step_size = recommendations['step_size']
+                
+                # 记录推荐信息到DataFrame
+				df.loc[idx, 'recommended_patch_level'] = adaptive_patch_level
+				df.loc[idx, 'recommended_step_size'] = adaptive_step_size
+				df.loc[idx, 'expected_patches'] = recommendations['expected_patches']
+				df.loc[idx, 'actual_mpp'] = recommendations['actual_mpp']
+				df.loc[idx, 'actual_physical_size'] = recommendations['actual_physical_size']
+                
+				print(f"Applied adaptive parameters: patch_level={adaptive_patch_level}, step_size={adaptive_step_size}")
+                
+			except Exception as e:
+				print(f"Warning: Error in adaptive parameter adjustment for {slide_id}: {e}")
+				print("Using original parameters")
+				adaptive_patch_level = patch_level
+				adaptive_step_size = step_size
+		else:
+			adaptive_patch_level = patch_level
+			adaptive_step_size = step_size
+		
 		seg_time_elapsed = -1
 		if seg:
 			try:
@@ -212,9 +268,9 @@ def seg_and_patch(source, save_dir, patch_save_dir, mask_save_dir, stitch_save_d
 			try:    # from current_patch_params or defaults.
 				num_patches_saved = WSI_object.process_contours_and_save_patches(
                     patch_output_root_dir=patch_save_dir, # This is the root dir for all slide patch folders
-                    patch_level=patch_level,
+                    patch_level=adaptive_patch_level,  # 使用自适应参数
                     patch_size=patch_size,
-                    step_size=step_size,
+                    step_size=adaptive_step_size,  # 使用自适应参数
                     contour_fn=current_patch_params.get('contour_fn', 'four_pt'),
                     use_padding=current_patch_params.get('use_padding', True),
                     white_thresh=current_patch_params.get('white_thresh', 15),
@@ -222,6 +278,10 @@ def seg_and_patch(source, save_dir, patch_save_dir, mask_save_dir, stitch_save_d
                     white_black_filter=current_patch_params.get('white_black_filter', True)
                 )
 				patch_time_elapsed = time.time() - patch_start_time
+				
+				# 记录实际生成的patch数量
+				df.loc[idx, 'actual_patches'] = num_patches_saved
+
 				if num_patches_saved == 0 and WSI_object.contours_tissue and len(WSI_object.contours_tissue) > 0:
 					print(f"Warning: No patches were saved for {slide_id} despite having tissue contours.")
                     # Optionally set a specific status if no patches are saved from valid contours
@@ -271,6 +331,21 @@ parser.add_argument('--patch_level', type=int, default=0,
 					help='downsample level at which to patch')
 parser.add_argument('--process_list',  type = str, default=None,
 					help='name of list of images to process with parameters (.csv)')
+
+# 新增自适应参数控制选项
+parser.add_argument('--auto_adjust_params', default=False, action='store_true',
+                    help='enable adaptive parameter adjustment')
+parser.add_argument('--target_patch_mpp', type=float, default=0.75,
+                    help='target patch MPP (micrometers per pixel)')
+parser.add_argument('--target_patch_physical_size', type=int, default=None,
+                    help='target patch physical size in micrometers')
+parser.add_argument('--min_patches_target', type=int, default=300,
+                    help='minimum target number of patches per WSI')
+parser.add_argument('--max_patches_target', type=int, default=2500,
+                    help='maximum target number of patches per WSI')
+parser.add_argument('--default_wsi_mpp', type=float, default=0.25,
+                    help='default WSI MPP when not available in metadata')
+
 
 if __name__ == '__main__':
 	args = parser.parse_args()
@@ -337,4 +412,10 @@ if __name__ == '__main__':
 											seg = args.seg,  use_default_params=False, save_mask = True, 
 											stitch= args.stitch,
 											patch_level=args.patch_level, patch = args.patch,
-											process_list = process_list, auto_skip=args.no_auto_skip)
+											process_list = process_list, auto_skip=args.no_auto_skip,
+											auto_adjust_params=args.auto_adjust_params,
+											target_patch_mpp=args.target_patch_mpp,
+											target_patch_physical_size=args.target_patch_physical_size,
+											min_patches_target=args.min_patches_target,
+											max_patches_target=args.max_patches_target,
+											default_wsi_mpp=args.default_wsi_mpp)
