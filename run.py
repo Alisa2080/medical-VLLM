@@ -2,9 +2,9 @@ import os
 import copy
 import pytorch_lightning as pl
 
-from vlmo.config import ex
-from vlmo.modules import VLMo
-from vlmo.datamodules.multitask_datamodule import MTDataModule
+from config import ex
+from models.vlmo_module import VLMo
+from datamodules.multitask_datamodule import MTDataModule
 import torch
 from pytorch_lightning.plugins import environments as pl_env
 from pytorch_lightning.utilities import rank_zero_info
@@ -27,12 +27,12 @@ def main(config):
     pl.seed_everything(config["seed"])
 
     if "textmlm" in config["exp_name"] or config.get("model_type") == "VLMoForTextPretraining":
-        from vlmo.models.vlmo_module import VLMoForTextPretraining # 确保导入
+        from models.vlmo_module import VLMoForTextPretraining # 确保导入
         model_class = VLMoForTextPretraining
         rank_zero_info("Using model: VLMoForTextPretraining")
     else:
         # 默认使用旧的 VLMo 或其他多任务模型
-        from vlmo.models.vlmo_module import VLMo # 确保导入
+        from models.vlmo_module import VLMo # 确保导入
         model_class = VLMo
         rank_zero_info("Using model: VLMo (multitask)")
 

@@ -7,8 +7,8 @@ import torch.backends.cudnn as cudnn
 import json
 import os
 import sys
-import model.pretrained_model
-import model.vqkd_model
+import models.pretrained_model
+import models.vqkd_model
 from pathlib import Path
 from timm.models import create_model
 from PIL import PngImagePlugin
@@ -27,17 +27,16 @@ torch.autograd.set_detect_anomaly(True)
 def get_args():
     parser = argparse.ArgumentParser('BEiT pre-training script', add_help=False)
     # 默认的命令行参数
-    parser.add_argument('--batch_size', default=64, type=int)
-    parser.add_argument('--epochs', default=30, type=int)
+    parser.add_argument('--batch_size', default=4, type=int)
+    parser.add_argument('--epochs', default=10, type=int)
     parser.add_argument('--save_ckpt_freq', default=10, type=int)
-    parser.add_argument('--tokenizer_weight', type=str,default= r"/gz-data/image_tokenizer.pth")
+    parser.add_argument('--tokenizer_weight', type=str,default= r"E:\article_code\weight\image_tokenizer.pth")
     parser.add_argument('--tokenizer_model', type=str, default="vqkd_encoder_base_decoder_3x768x12_clip")
-    parser.add_argument('--model', default='beit_base_patch16_384_8k_vocab_used', type=str)
+    parser.add_argument('--model', default='VisionEncoder_base_patch16_384_8k', type=str)
 
     #掩码参数
     parser.add_argument('--num_mask_patches', default=230, type=int,
-                        help='number of the visual tokens/patches need be masked')
-    parser.add_argument('--mask_schedule_epochs',type=int,default=None,help='用于 mask 难度调度的 epoch 数，默认等于 warmup_epochs')
+                        help='maximum number of patches to be masked (threshold)')
     parser.add_argument('--max_mask_patches_per_block', type=int, default=75)
     parser.add_argument('--min_mask_patches_per_block', type=int, default=16)
     
@@ -49,7 +48,7 @@ def get_args():
                         help='Bias towards foreground regions in masking [0, 1]')
     parser.add_argument('--complexity_adaptive', action='store_true', default=True,
                         help='Adapt masking ratio based on image complexity')
-    parser.add_argument('--curriculum_masking', action='store_true', default=False,
+    parser.add_argument('--curriculum_masking', action='store_true', default= True,
                         help='Use curriculum learning for masking difficulty')
     
     # 输入尺寸参数
@@ -90,7 +89,7 @@ def get_args():
                         help='warmup learning rate (default: 1e-6)')
     parser.add_argument('--min_lr', type=float, default=1e-5, metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
-    parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
+    parser.add_argument('--warmup_epochs', type=int, default=2, metavar='N',
                         help='epochs to warmup LR, if scheduler supports')
     parser.add_argument('--warmup_steps', type=int, default=-1, metavar='N',
                         help='epochs to warmup LR, if scheduler supports')
@@ -111,18 +110,18 @@ def get_args():
                         help='min_crop_scale (default: 0.08)')
     
     # 数据集参数
-    parser.add_argument('--data_path', default=r'/gz-data/patches', type=str,
+    parser.add_argument('--data_path', default=r'E:\datasets\medical_images\patches', type=str,
                         help='dataset path')
     parser.add_argument('--eval_data_path', default='', type=str, help='dataset path')
     parser.add_argument('--data_set', default='image_folder',  type=str, help='dataset path')
     parser.add_argument('--imagenet_default_mean_and_std', default=True, action='store_true')
 
     # 输出和设备参数
-    parser.add_argument('--output_dir', default=r'/gz-data/output/beit2', type=str,
+    parser.add_argument('--output_dir', default=r'E:\datasets\medical_images\output\beit2', type=str,
                         help='path where to save, empty for no saving')
-    parser.add_argument('--log_dir', default=r'/gz-data/log/beit2', type=str,
+    parser.add_argument('--log_dir', default=r'E:\datasets\medical_images\output\beit2', type=str,
                         help='path where to tensorboard log')
-    parser.add_argument('--device', default='cuda',
+    parser.add_argument('--device', default='cuda', type=str,
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
@@ -132,7 +131,7 @@ def get_args():
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')    
-    parser.add_argument('--num_workers', default=10, type=int)
+    parser.add_argument('--num_workers', default=2, type=int)
     parser.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem',
@@ -185,7 +184,9 @@ class PathologyMaskingCallback(pl.Callback):
         
         # 日志记录掩码策略信息
         strategy = getattr(self.data_augmentation.masking_generator, 'strategy', 'unknown')
+        curriculum_masking = getattr(self.data_augmentation.masking_generator, 'curriculum_masking', False)
         curriculum_progress = getattr(self.data_augmentation.masking_generator, 'curriculum_progress', 0.0)
+        max_masks = getattr(self.data_augmentation.masking_generator, 'max_masking_patches', 0)
         
         pl_module.log("masking/strategy", 
                       hash(strategy) % 1000,  # 简单的策略编码
@@ -193,10 +194,20 @@ class PathologyMaskingCallback(pl.Callback):
         pl_module.log("masking/curriculum_progress", 
                       curriculum_progress, 
                       on_epoch=True, prog_bar=False)
+        pl_module.log("masking/max_allowed_masks", 
+                      max_masks, 
+                      on_epoch=True, prog_bar=False)
+        
+        # 记录当前epoch的预期掩码数量
+        if curriculum_masking and hasattr(self.data_augmentation.masking_generator, '_get_curriculum_base_masks'):
+            expected_masks = self.data_augmentation.masking_generator._get_curriculum_base_masks()
+            pl_module.log("masking/expected_base_masks", expected_masks, on_epoch=True, prog_bar=False)
+        else:
+            # 非课程学习模式，记录最大掩码数量作为期望值
+            pl_module.log("masking/expected_base_masks", max_masks, on_epoch=True, prog_bar=False)
         
         # 如果是课程学习，记录当前的掩码参数
-        if hasattr(self.data_augmentation.masking_generator, 'curriculum_masking') and \
-           self.data_augmentation.masking_generator.curriculum_masking:
+        if curriculum_masking:
             adaptive_min, adaptive_max = self.data_augmentation.masking_generator._compute_adaptive_block_size()
             pl_module.log("masking/adaptive_min_patches", adaptive_min, on_epoch=True, prog_bar=False)
             pl_module.log("masking/adaptive_max_patches", adaptive_max, on_epoch=True, prog_bar=False)
@@ -205,56 +216,191 @@ class PathologyMaskingCallback(pl.Callback):
         if current_epoch == 0:
             print(f"\n=== Pathology Masking Configuration ===")
             print(f"Strategy: {strategy}")
+            print(f"Curriculum masking: {curriculum_masking}")
+            print(f"Max masking patches: {max_masks}")
             print(f"Foreground bias: {getattr(self.data_augmentation.masking_generator, 'foreground_bias', 'N/A')}")
             print(f"Complexity adaptive: {getattr(self.data_augmentation.masking_generator, 'complexity_adaptive', 'N/A')}")
-            print(f"Curriculum masking: {getattr(self.data_augmentation.masking_generator, 'curriculum_masking', 'N/A')}")
-            print(f"Base masking patches: {getattr(self.data_augmentation.masking_generator, 'base_num_masking_patches', 'N/A')}")
+            
+            if curriculum_masking and hasattr(self.data_augmentation.masking_generator, 'curriculum_min_masks'):
+                print(f"Curriculum min patches: {self.data_augmentation.masking_generator.curriculum_min_masks}")
+                print(f"Masking will start low and gradually increase")
+            else:
+                variation = int(max_masks * 0.05)
+                print(f"No curriculum learning - will use close to {max_masks} masks")
+                print(f"Allowed range: {max_masks - variation} - {max_masks}")
             print("=====================================\n")
         
         # 每10个epoch记录一次进度
         if current_epoch % 10 == 0:
-            print(f"Epoch {current_epoch}: Masking curriculum progress = {curriculum_progress:.3f}")
+            if curriculum_masking and hasattr(self.data_augmentation.masking_generator, '_get_curriculum_base_masks'):
+                current_base = self.data_augmentation.masking_generator._get_curriculum_base_masks()
+                print(f"Epoch {current_epoch}: Curriculum progress = {curriculum_progress:.3f}, "
+                      f"Expected base masks = {current_base}")
+            else:
+                print(f"Epoch {current_epoch}: Using close to max masks = {max_masks}")
 
 class MaskingMetricsCallback(pl.Callback):
-    """掩码质量监控回调"""
+    """掩码质量监控回调 - 增强版"""
     
     def __init__(self):
         super().__init__()
         self.mask_stats = []
+        self.complexity_stats = []
     
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         """记录掩码统计信息"""
-        if batch_idx % 100 == 0:  # 每100个batch记录一次
-            # 从batch中获取掩码信息
-            if isinstance(batch, (list, tuple)) and len(batch) >= 1:
-                packed_data = batch[0]
-                if isinstance(packed_data, (list, tuple)) and len(packed_data) >= 3:
-                    _, _, bool_masked_pos = packed_data
-                    
-                    if isinstance(bool_masked_pos, torch.Tensor):
-                        batch_size = bool_masked_pos.shape[0]
-                        total_patches = bool_masked_pos.shape[1] if bool_masked_pos.dim() == 2 else bool_masked_pos.numel() // batch_size
+        if batch_idx % 50 == 0:  # 增加记录频率
+            try:
+                # 从batch中获取掩码信息
+                if isinstance(batch, (list, tuple)) and len(batch) >= 1:
+                    packed_data = batch[0]
+                    if isinstance(packed_data, (list, tuple)) and len(packed_data) >= 3:
+                        _, _, bool_masked_pos = packed_data
                         
-                        # 计算掩码率
-                        mask_ratios = bool_masked_pos.sum(dim=-1).float() / total_patches
-                        avg_mask_ratio = mask_ratios.mean().item()
-                        std_mask_ratio = mask_ratios.std().item()
+                        if isinstance(bool_masked_pos, torch.Tensor):
+                            # 处理不同的张量形状
+                            original_shape = bool_masked_pos.shape
+                            
+                            if bool_masked_pos.dim() == 1:
+                                # 计算每个样本的patch数
+                                total_elements = bool_masked_pos.numel()
+                                # 假设是24x24=576个patches per sample
+                                patches_per_sample = 576
+                                batch_size = total_elements // patches_per_sample
+                                
+                                if batch_size * patches_per_sample == total_elements:
+                                    bool_masked_pos = bool_masked_pos.view(batch_size, patches_per_sample)
+                                else:
+                                    print(f"[WARNING] Cannot reshape mask tensor: total={total_elements}")
+                                    return
+                            
+                            elif bool_masked_pos.dim() == 2:
+                                batch_size, patches_per_sample = bool_masked_pos.shape
+                            else:
+                                print(f"[WARNING] Unexpected mask tensor dimensions: {bool_masked_pos.shape}")
+                                return
+                            
+                            # 计算详细的掩码统计
+                            mask_counts = bool_masked_pos.sum(dim=-1).cpu().numpy()  # 每个样本的掩码数量
+                            mask_ratios = mask_counts.astype(float) / patches_per_sample
+                            
+                            # 统计指标
+                            avg_mask_ratio = float(np.mean(mask_ratios))
+                            std_mask_ratio = float(np.std(mask_ratios))
+                            min_masks = int(np.min(mask_counts))
+                            max_masks = int(np.max(mask_counts))
+                            avg_masks = float(np.mean(mask_counts))
+                            
+                            # 计算掩码数量的分布
+                            unique_counts, count_frequencies = np.unique(mask_counts, return_counts=True)
+                            mask_diversity = len(unique_counts)  # 不同掩码数量的种类数
+                            
+                            # 记录到TensorBoard
+                            pl_module.log("masking/avg_mask_ratio", avg_mask_ratio, 
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            pl_module.log("masking/std_mask_ratio", std_mask_ratio, 
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            pl_module.log("masking/min_mask_count", min_masks, 
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            pl_module.log("masking/max_mask_count", max_masks, 
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            pl_module.log("masking/avg_mask_count", avg_masks, 
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            pl_module.log("masking/mask_diversity", mask_diversity, 
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            pl_module.log("masking/mask_range", max_masks - min_masks, 
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            
+                            # 详细调试信息
+                            if batch_idx % 500 == 0:
+                                print(f"\n[MASKING METRICS] Batch {batch_idx}:")
+                                print(f"  Batch size: {batch_size}")
+                                print(f"  Patches per sample: {patches_per_sample}")
+                                print(f"  Mask counts: min={min_masks}, max={max_masks}, avg={avg_masks:.1f}")
+                                print(f"  Mask ratios: min={np.min(mask_ratios):.3f}, max={np.max(mask_ratios):.3f}, avg={avg_mask_ratio:.3f}")
+                                print(f"  Std deviation: {std_mask_ratio:.3f}")
+                                print(f"  Mask diversity: {mask_diversity} different counts")
+                                print(f"  Unique counts: {unique_counts[:10]}...")  # 显示前10个
+                                
+                                # 检查是否存在复杂度自适应
+                                if std_mask_ratio < 0.001:
+                                    print(f"  [ALERT] Very low mask variance detected!")
+                                    print(f"  This suggests complexity adaptation may not be working properly.")
+                                else:
+                                    print(f"  [OK] Good mask variance detected, complexity adaptation appears active.")
+                            
+                            # 异常检测
+                            if std_mask_ratio == 0.0 and batch_idx > 100:
+                                print(f"[CRITICAL] Zero mask variance at batch {batch_idx}!")
+                                print(f"This indicates all samples have identical mask counts: {mask_counts}")
+                                print(f"Complexity adaptive masking may be disabled or malfunctioning.")
                         
-                        # 记录掩码统计
-                        pl_module.log("masking/avg_mask_ratio", avg_mask_ratio, 
-                                    on_step=True, on_epoch=True, prog_bar=False)
-                        pl_module.log("masking/std_mask_ratio", std_mask_ratio, 
-                                    on_step=True, on_epoch=True, prog_bar=False)
+            except Exception as e:
+                print(f"[ERROR] Failed to log mask statistics: {e}")
+                import traceback
+                traceback.print_exc()
+
+class ComplexityDistributionCallback(pl.Callback):
+    """监控图像复杂度分布的回调"""
+    
+    def __init__(self):
+        super().__init__()
+        self.complexity_samples = []
+        self.mask_count_samples = []
+    
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """记录复杂度和掩码数量的关系"""
+        if batch_idx % 200 == 0:  # 每200个batch检查一次
+            try:
+                # 模拟获取一些复杂度样本（实际中需要从数据增强器获取）
+                # 这里我们记录当前batch的掩码统计作为代理
+                if isinstance(batch, (list, tuple)) and len(batch) >= 1:
+                    packed_data = batch[0]
+                    if isinstance(packed_data, (list, tuple)) and len(packed_data) >= 3:
+                        _, _, bool_masked_pos = packed_data
                         
-                        # 记录掩码数量分布
-                        mask_counts = bool_masked_pos.sum(dim=-1)
-                        min_masks = mask_counts.min().item()
-                        max_masks = mask_counts.max().item()
+                        if isinstance(bool_masked_pos, torch.Tensor):
+                            if bool_masked_pos.dim() == 1:
+                                patches_per_sample = 576
+                                batch_size = bool_masked_pos.numel() // patches_per_sample
+                                if batch_size * patches_per_sample == bool_masked_pos.numel():
+                                    bool_masked_pos = bool_masked_pos.view(batch_size, patches_per_sample)
+                                else:
+                                    return
+                            
+                            mask_counts = bool_masked_pos.sum(dim=-1).cpu().numpy()
+                            
+                            # 计算复杂度分布统计
+                            complexity_range = np.max(mask_counts) - np.min(mask_counts)
+                            complexity_cv = np.std(mask_counts) / (np.mean(mask_counts) + 1e-8)  # 变异系数
+                            
+                            pl_module.log("complexity/mask_count_range", complexity_range,
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            pl_module.log("complexity/mask_count_cv", complexity_cv,
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            
+                            # 记录分位数
+                            percentiles = np.percentile(mask_counts, [10, 25, 50, 75, 90])
+                            pl_module.log("complexity/mask_p10", percentiles[0],
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            pl_module.log("complexity/mask_p25", percentiles[1],
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            pl_module.log("complexity/mask_p50", percentiles[2],
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            pl_module.log("complexity/mask_p75", percentiles[3],
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            pl_module.log("complexity/mask_p90", percentiles[4],
+                                        on_step=True, on_epoch=True, prog_bar=False)
+                            
+                            if batch_idx % 1000 == 0:
+                                print(f"\n[COMPLEXITY DISTRIBUTION] Batch {batch_idx}:")
+                                print(f"  Mask count range: {complexity_range}")
+                                print(f"  Coefficient of variation: {complexity_cv:.3f}")
+                                print(f"  Percentiles: {percentiles}")
                         
-                        pl_module.log("masking/min_mask_count", min_masks, 
-                                    on_step=True, on_epoch=True, prog_bar=False)
-                        pl_module.log("masking/max_mask_count", max_masks, 
-                                    on_step=True, on_epoch=True, prog_bar=False)
+            except Exception as e:
+                print(f"[ERROR] Complexity distribution logging failed: {e}")
+
 
 def get_visual_tokenizer(args):
 
@@ -277,41 +423,54 @@ def print_masking_strategy_info(args):
     print("PATHOLOGY MASKING STRATEGY CONFIGURATION")
     print("="*60)
     print(f"Strategy: {args.masking_strategy}")
-    print(f"Base masking patches: {args.num_mask_patches}")
+    print(f"Max masking patches (threshold): {args.num_mask_patches}")
     print(f"Min patches per block: {args.min_mask_patches_per_block}")
     print(f"Max patches per block: {args.max_mask_patches_per_block}")
     print(f"Foreground bias: {args.foreground_bias}")
     print(f"Complexity adaptive: {args.complexity_adaptive}")
     print(f"Curriculum masking: {args.curriculum_masking}")
     
-    if args.masking_strategy == 'pathology_aware':
-        print("\nPathology-aware masking will:")
-        print("  - Detect foreground/background regions")
-        print("  - Compute information entropy maps")
-        print("  - Compute gradient intensity maps")
-        print("  - Bias masking towards foreground regions")
-        print("  - Adapt masking based on image complexity")
-    elif args.masking_strategy == 'entropy_based':
-        print("\nEntropy-based masking will:")
-        print("  - Prioritize high-entropy regions")
-        print("  - Focus on texturally complex areas")
-    elif args.masking_strategy == 'gradient_based':
-        print("\nGradient-based masking will:")
-        print("  - Prioritize high-gradient regions")
-        print("  - Focus on edge-rich areas")
-    elif args.masking_strategy == 'block':
-        print("\nBlock masking will:")
-        print("  - Use optimized block-wise masking")
-        print("  - Support curriculum learning if enabled")
-    else:
-        print("\nRandom masking will:")
-        print("  - Use random patch selection")
-    
     if args.curriculum_masking:
-        print(f"\nCurriculum learning enabled:")
-        print(f"  - Will start with smaller blocks and lower masking rate")
-        print(f"  - Will gradually increase difficulty over {args.epochs} epochs")
-        print(f"  - Progress will be tracked and logged")
+        curriculum_min = max(args.min_mask_patches_per_block, int(args.num_mask_patches * 0.3))
+        print(f"\nCurriculum learning configuration:")
+        print(f"  - Initial masks: ~{curriculum_min} patches")
+        print(f"  - Final masks: ~{args.num_mask_patches} patches")
+        print(f"  - Progress over {int(args.epochs * 0.8)} epochs")
+        print(f"  - All strategies will follow curriculum progression")
+    else:
+        print(f"\nNo curriculum learning:")
+        print(f"  - All strategies will use close to {args.num_mask_patches} masks")
+        print(f"  - Allowed variation: ±{int(args.num_mask_patches * 0.05)} patches")
+        print(f"  - Range: {args.num_mask_patches - int(args.num_mask_patches * 0.05)} - {args.num_mask_patches}")
+    
+    if args.complexity_adaptive:
+        print(f"\nComplexity adaptation enabled:")
+        print(f"  - Complex images: reduce masks by up to 20%")
+        print(f"  - Simple images: increase masks by up to 20%")
+        print(f"  - Applied on top of base mask count")
+    
+    if args.masking_strategy == 'pathology_aware':
+        print("\nPathology-aware masking features:")
+        print("  - Foreground/background detection")
+        print("  - Information entropy analysis")
+        print("  - Gradient intensity analysis")
+        print("  - Weighted block generation (70% blocks + 30% weighted random)")
+    elif args.masking_strategy == 'entropy_based':
+        print("\nEntropy-based masking:")
+        print("  - Prioritizes high-entropy regions")
+        print("  - Focuses on texturally complex areas")
+    elif args.masking_strategy == 'gradient_based':
+        print("\nGradient-based masking:")
+        print("  - Prioritizes high-gradient regions")
+        print("  - Focuses on edge-rich areas")
+    elif args.masking_strategy == 'block':
+        print("\nBlock masking:")
+        print("  - Optimized block-wise masking")
+        print("  - Maintains spatial coherence")
+    else:
+        print("\nRandom masking:")
+        print("  - Pure random patch selection")
+        print("  - No spatial or content bias")
     
     print("="*60 + "\n")
 
@@ -329,6 +488,26 @@ def main(args):
     args.window_size = (args.input_size // patch_size, args.input_size // patch_size)
     args.patch_size = patch_size
     
+        # 添加详细的参数验证和调试信息
+    total_patches = args.window_size[0] * args.window_size[1]
+    print(f"\n[DEBUG] Detailed Masking Configuration:")
+    print(f"  Input size: {args.input_size}")
+    print(f"  Patch size: {patch_size}")
+    print(f"  Window size: {args.window_size}")
+    print(f"  Total patches: {total_patches}")
+    print(f"  Max mask patches: {args.num_mask_patches}")
+    print(f"  Max mask ratio: {args.num_mask_patches / total_patches:.3f}")
+    
+    if args.curriculum_masking:
+        curriculum_min = max(args.min_mask_patches_per_block, int(args.num_mask_patches * 0.3))
+        print(f"  Curriculum min masks: {curriculum_min}")
+        print(f"  Curriculum min ratio: {curriculum_min / total_patches:.3f}")
+    
+    if args.num_mask_patches >= total_patches:
+        print(f"[ERROR] Max mask patches ({args.num_mask_patches}) >= total patches ({total_patches})")
+        args.num_mask_patches = total_patches - 10  # 留一些余量
+        print(f"[FIXED] Adjusted max mask patches to {args.num_mask_patches}")
+   
     # 创建数据集和数据增强器
     print("\nBuilding dataset with pathology-specific augmentations...")
     dataset_train = build_beit_pretraining_dataset(args)
@@ -363,6 +542,8 @@ def main(args):
     if num_training_steps_per_epoch == 0: # Handle small datasets
         num_training_steps_per_epoch = 1
         print("Warning: Very small dataset detected, setting num_training_steps_per_epoch=1")
+    
+    
     
     print(f"\nTraining Configuration:")
     print(f"  Dataset size: {len(dataset_train)}")
@@ -428,6 +609,10 @@ def main(args):
     # 掩码质量监控回调
     masking_metrics_callback = MaskingMetricsCallback()
     callbacks.append(masking_metrics_callback)
+    
+    # 复杂度分布监控回调
+    complexity_distribution_callback = ComplexityDistributionCallback()
+    callbacks.append(complexity_distribution_callback)
     
     # 检查点恢复逻辑
     ckpt_path = None

@@ -8,7 +8,8 @@ from typing import Optional, Tuple, Callable, List, Dict
 import numpy as np
 from modules.Encoder import TransformerEncoder
 from transformers.models.bert.modeling_bert import BertConfig, BertEmbeddings
-from vlmo.modules import heads, objectives, vlmo_utils
+from modules import heads, objectives
+from utils import vlmo_utils
 from pytorch_lightning.utilities import rank_zero_info
 from scipy import interpolate
 from timm.models import create_model

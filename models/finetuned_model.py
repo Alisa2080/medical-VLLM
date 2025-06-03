@@ -5,9 +5,8 @@ from functools import partial
 from timm.models import register_model
 from timm.layers import trunc_normal_ as __call_trunc_normal_
 import timm.models as models
-from module.VisionTransformer import VisionTransformer
-from module.VITForMIM_CLS import VisionTransformerForMaskedImageModelingCLS
-from module.VITForMIM import VisionTransformerForMaskedImageModeling
+from modules.VisionTransformer import VisionTransformer
+from modules.VITForMIM import VisionTransformerForMaskedImageModeling
 
 def _cfg(url='', **kwargs):
     return {

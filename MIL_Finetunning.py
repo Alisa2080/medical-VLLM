@@ -12,10 +12,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from PIL import PngImagePlugin 
 from pathlib import Path
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
-# Your custom modules
 
 from datasets.vision_datasets.WSIDataModule import WSIDataModule
-from model.VIT_CLassifer import ViTClassifier, MILFineTuningModule 
+from models.VIT_CLassifer import ViTClassifier, MILFineTuningModule 
 
 PngImagePlugin.MAX_TEXT_CHUNK = 100 * (1024 ** 2)
 torch.set_float32_matmul_precision('high')

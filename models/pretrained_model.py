@@ -11,7 +11,7 @@ from modules.RMSNorm import RMSNorm
 
 
 @register_model
-def VisionTransformerEncoder_base_patch16_384_8k(**kwargs): 
+def VisionEncoder_base_patch16_384_8k(**kwargs): 
     model = VisionTransformerForMaskedImageModeling(
         img_size=384,patch_size=16, in_chans=3,dim=512, depth=6, num_heads=8, num_kv_heads=4, mlp_ratio=4, qkv_bias=False,
         norm_layer=RMSNorm, eps=1e-6, attn_drop_rate=0.01, drop_path_rate=0.0, hidden_act="silu", layer_scale_init_values=0.1, vocab_size=8192,

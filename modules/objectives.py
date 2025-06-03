@@ -12,8 +12,7 @@ from torch.utils.data.distributed import DistributedSampler
 from einops import rearrange
 from pytorch_lightning.utilities import rank_zero_info
 import torchmetrics
-from vlmo.modules.dist_utils import all_gather
-from vlmo.gadgets.my_metrics import Accuracy as MyAccuracy, Scalar as MyScalar, VQAScore as MyVQAScore
+from metrics.my_metrics import Accuracy as MyAccuracy, Scalar as MyScalar, VQAScore as MyVQAScore
 
 
 def _get_mlm_acc_metric(pl_module):

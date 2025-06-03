@@ -3,11 +3,11 @@ import torch
 import argparse
 import math
 import torch.nn as nn
-from modules.Block import EncoderBlock
-from modules.PatchEmbed import PatchEmbed, HybridEmbed,PatchEmbed_PT
+from modules.Block import VisionEncoderBlock
+from modules.PatchEmbed import PatchEmbed,PatchEmbed_PT
 from timm.layers import trunc_normal_ as __call_trunc_normal_
 from modules.RMSNorm import RMSNorm
-from.rope import Rope2DPosEmb
+from modules.rope import Rope2DPosEmb
 from modules.AttentionSeries import P2TAttention
 from modules.PatchEmbed import Learnable2DInterpPosEmb
 from typing import Optional, Tuple,Callable
@@ -98,7 +98,7 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)] 
         # 初始化 Transformer 块
         self.blocks = nn.ModuleList([
-            EncoderBlock( 
+            VisionEncoderBlock( 
                 dim=dim,
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
@@ -170,9 +170,9 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
             # 2D 位置编码初始化
             trunc_normal_(m.pos_embed, std=0.02)
             
-        elif isinstance(m, EncoderBlock):
-            # EncoderBlock 特殊初始化
-            self._init_encoder_block(m)
+        elif isinstance(m, VisionEncoderBlock):
+            # VisionEncoderBlock 特殊初始化
+            self._init_vision_encoder_block(m)
 
     def _init_p2t_attention(self, m: P2TAttention):
         """初始化 P2TAttention 模块"""
@@ -198,8 +198,8 @@ class VisionTransformerForMaskedImageModeling(nn.Module):
                 if conv.bias is not None:
                     nn.init.constant_(conv.bias, 0)
 
-    def _init_encoder_block(self, block: EncoderBlock):
-        """初始化 EncoderBlock 模块"""
+    def _init_vision_encoder_block(self, block: VisionEncoderBlock):
+        """初始化 VisionEncoderBlock 模块"""
         # 注意力模块的输出投影层标记
         if hasattr(block.attn, 'o_proj'):
             block.attn.o_proj._is_output_projection = True

@@ -22,7 +22,7 @@ from .vlmo_config import VLMoEncoderDecoderConfig
 from .Encoder_Decoder import VLMoEncoderDecoder
 # 尝试导入 RMSNorm
 try:
-    from .RMSNorm import RMSNorm
+    from modules.RMSNorm import RMSNorm
 except ImportError:
     RMSNorm = nn.LayerNorm
     warnings.warn("RMSNorm not found, using nn.LayerNorm as fallback for config reconstruction.")

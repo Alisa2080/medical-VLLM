@@ -7,8 +7,8 @@ from transformers import (
     get_polynomial_decay_schedule_with_warmup,
     get_cosine_schedule_with_warmup,
 )
-from vlmo.modules.objectives import compute_irtr_recall, compute_irtr_recall_with_rerank
-from vlmo.gadgets.my_metrics import Accuracy, VQAScore, Scalar
+from modules.objectives import compute_irtr_recall, compute_irtr_recall_with_rerank
+from metrics.my_metrics import Accuracy, VQAScore, Scalar
 from pytorch_lightning.utilities import rank_zero_info
 TEXT_PRETRAIN_METRIC_NAME = "textmlm_accuracy"
 TEXT_PRETRAIN_TASK_KEY = "textmlm"

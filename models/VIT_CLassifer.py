@@ -6,12 +6,12 @@ from modules.VITForMIM import VisionTransformerForMaskedImageModeling
 from modules.AttentionSeries import GatedAttention 
 from timm.models import create_model
 from typing import Optional, Tuple,Callable, Iterable,List
-from model import pretrained_model
+from models import pretrained_model
 from modules.Losses import LDAMLoss, ClassBalancedLoss,CBCrossEntropyLoss
 from PIL import Image 
 import pytorch_lightning as pl
 from sklearn.metrics import classification_report, confusion_matrix, balanced_accuracy_score
-from dataset.WSIBagDatasetMTL import WSIBagDatasetMIL, SinglePatchDataset
+from datasets.vision_datasets.WSIBagDatasetMTL import WSIBagDatasetMIL, SinglePatchDataset
 from torch.utils.data import DataLoader
 from modules.optim_factory import create_optimizer, get_parameter_groups
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR

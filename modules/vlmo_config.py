@@ -5,7 +5,7 @@ import warnings
 
 # 导入 RMSNorm 以便在 from_encoder_decoder_configs 中使用
 try:
-    from .RMSNorm import RMSNorm
+    from modules.RMSNorm import RMSNorm
 except ImportError:
     # 提供一个备用方案
     RMSNorm = None

@@ -333,10 +333,6 @@ def accimage_loader(path: str) -> Any:
 
 
 
-
-
-
-
 class ImageFolder(DatasetFolder):
     """A generic data loader where the images are arranged in this way: ::
 

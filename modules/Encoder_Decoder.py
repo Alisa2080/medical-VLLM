@@ -6,10 +6,10 @@ from functools import partial
 import warnings
 
 # 从项目模块导入
-from .Encoder import MultiWayTransformer, vlmo_base_patch16, vlmo_large_patch16, vlmo_base_plus_patch16 # 假设这些函数返回 MultiWayTransformer 实例
-from .Decoder import TransformerDecoder
-from .rope import Rope2DPosEmb, DeepseekV3RotaryEmbedding, apply_rotary_pos_emb, apply_rope,SimpleQwen3RotaryEmbedding # Ensure apply_rope is imported
-from .RMSNorm import RMSNorm
+from modules.Encoder import MultiWayTransformer, vlmo_base_patch16, vlmo_large_patch16, vlmo_base_plus_patch16 # 假设这些函数返回 MultiWayTransformer 实例
+from modules.Decoder import TransformerDecoder
+from modules.rope import Rope2DPosEmb, DeepseekV3RotaryEmbedding, apply_rotary_pos_emb, apply_rope,SimpleQwen3RotaryEmbedding # Ensure apply_rope is imported
+from modules.RMSNorm import RMSNorm
 from timm.models import create_model # 用于创建 Encoder
 
 from transformers.modeling_outputs import Seq2SeqLMOutput
