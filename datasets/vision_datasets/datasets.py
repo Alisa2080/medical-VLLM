@@ -260,18 +260,6 @@ class DataAugmentationForBEiT(object):
             for_patches = result
             for_visual_tokens = result
         
-        import time
-        import random
-
-
-        # 为每个样本设置不同的随机种子
-        current_time = time.time()
-        sample_seed = int((current_time * 1000000) % 2**32)
-        
-        # 临时设置随机种子，生成掩码后恢复
-        old_state = random.getstate()
-        random.seed(sample_seed)  # 设置随机种子
-        # 传递原始图像给掩码生成器
         mask_2d = self.masking_generator(original_image)  # (H, W)
         mask_1d = mask_2d.flatten()  # (H*W,)
         

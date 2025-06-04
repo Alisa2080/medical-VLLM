@@ -13,246 +13,406 @@ from utils import vlmo_utils
 from pytorch_lightning.utilities import rank_zero_info
 from scipy import interpolate
 from timm.models import create_model
-
+from modules.CrossmodalMLMHead import CrossModalDecoder, CrossModalMLMHead
 from modules.RMSNorm import RMSNorm
 from transformers.activations import ACT2FN
+import torch
+from transformers import AutoTokenizer, BertTokenizer
+from pytorch_lightning.utilities import rank_zero_info
+from typing import Union, Tuple
+
+def load_tokenizer_with_vocab_size(tokenizer_path: str, use_distributed_loading: bool = False) -> Tuple[Union[AutoTokenizer, BertTokenizer], int]:
+    """
+    加载tokenizer并返回tokenizer对象和vocab_size
+    
+    Args:
+        tokenizer_path: tokenizer的路径或Hugging Face模型名称
+        use_distributed_loading: 是否使用分布式加载策略
+        
+    Returns:
+        tuple: (tokenizer对象, vocab_size)
+    """
+    rank_zero_info(f"Loading tokenizer from: {tokenizer_path}")
+    
+    if use_distributed_loading and torch.distributed.is_initialized():
+        # 分布式加载策略：只有rank 0加载，然后同步
+        if torch.distributed.get_rank() == 0:
+            rank_zero_info("Rank 0: Loading tokenizer...")
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            except Exception as e:
+                rank_zero_info(f"AutoTokenizer failed, trying BertTokenizer: {e}")
+                tokenizer = BertTokenizer.from_pretrained(tokenizer_path)
+        
+        # 同步所有进程
+        torch.distributed.barrier()
+        
+        # 其他进程也加载tokenizer
+        if torch.distributed.get_rank() != 0:
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            except Exception as e:
+                tokenizer = BertTokenizer.from_pretrained(tokenizer_path)
+    else:
+        # 非分布式加载
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        except Exception as e:
+            rank_zero_info(f"AutoTokenizer failed, trying BertTokenizer: {e}")
+            tokenizer = BertTokenizer.from_pretrained(tokenizer_path)
+    
+    vocab_size = tokenizer.vocab_size
+    rank_zero_info(f"Tokenizer loaded successfully. Vocab size: {vocab_size}")
+    
+    return tokenizer, vocab_size
+
+def update_model_arch_with_vocab_size(model_arch: dict, vocab_size: int) -> dict:
+    """
+    更新model_arch字典，添加动态确定的vocab_size
+    
+    Args:
+        model_arch: 原始的模型架构字典
+        vocab_size: 动态确定的词汇表大小
+        
+    Returns:
+        dict: 更新后的模型架构字典
+    """
+    updated_arch = model_arch.copy()
+    updated_arch["vocab_size"] = vocab_size
+    rank_zero_info(f"Updated model_arch with vocab_size: {vocab_size}")
+    return updated_arch
 
 class VLMoForTextPretraining(pl.LightningModule):
     def __init__(self, config_dict:dict):
         super().__init__()
-        self.save_hyperparameters({"config": config_dict})
+        tokenizer_path = config_dict.get("tokenizer")
+        if not tokenizer_path:
+            raise ValueError("TextPretraining requires 'tokenizer' configuration")
+        
+        rank_zero_info("VLMoForTextPretraining: Loading tokenizer to determine vocab_size...")
+        self.tokenizer, actual_vocab_size = load_tokenizer_with_vocab_size(
+            tokenizer_path, 
+            use_distributed_loading=False  # 在模型初始化时通常不需要分布式加载
+        )
+        
+        # 第二步：更新config_dict和model_arch，添加动态确定的vocab_size
+        config_dict = config_dict.copy()  # 避免修改原始配置
+        config_dict["vocab_size"] = actual_vocab_size  # 添加到config中以便后续使用
+        
+        model_arch = config_dict.get("model_arch", {})
+        model_arch = update_model_arch_with_vocab_size(model_arch, actual_vocab_size)
+        config_dict["model_arch"] = model_arch
+        
+        # 第三步：保存超参数
+        self.save_hyperparameters({
+            "config": config_dict,
+            "actual_vocab_size": actual_vocab_size,
+            "tokenizer_path": tokenizer_path
+        })
         self.config = config_dict
-        self.Encoder = create_model(config_dict["model_name"])
+        
+        # 第四步：创建编码器模型
+        model_arch = config_dict.get("model_arch", {})
+        self.Encoder = TransformerEncoder(
+            img_size=model_arch.get("img_size", 384),
+            patch_size=model_arch.get("patch_size", 16),
+            in_chans=model_arch.get("in_chans", 3),
+            embed_dim=model_arch.get("embed_dim", 512),
+            depth=model_arch.get("depth", 6),
+            num_heads=model_arch.get("num_heads", 8),
+            num_kv_heads=model_arch.get("num_kv_heads", 4),
+            qkv_bias=model_arch.get("qkv_bias", False),
+            qk_scale=model_arch.get("qk_scale", None),
+            attn_drop_rate=model_arch.get("attn_drop_rate", 0.0),
+            drop_path_rate=model_arch.get("drop_path_rate", 0.1),
+            norm_eps=model_arch.get("norm_eps", 1e-6),
+            layer_scale_init_values=model_arch.get("layer_scale_init_values", 0.01),
+            init_std=model_arch.get("init_std", 0.02),
+            # MoE参数
+            num_experts=model_arch.get("num_experts", 4),
+            num_experts_per_tok=model_arch.get("num_experts_per_tok", 2),
+            mlp_ratio=model_arch.get("mlp_ratio", 4.0),
+            norm_topk_prob=model_arch.get("norm_topk_prob", True),
+            moe_hidden_act=model_arch.get("moe_hidden_act", "silu"),
+            # RoPE参数
+            max_seq_len=config_dict.get("max_text_len", 196),
+            rope_base=model_arch.get("rope_base", 10000),
+            # Token Type参数
+            num_token_types=model_arch.get("num_token_types", 2),
+            vocab_size=actual_vocab_size,
+            padding_idx=model_arch.get("padding_idx", 0),
+        )
+
+        # 获取模型属性
         self.activation = self.Encoder.moe_hidden_act
         self.img_size = self.Encoder.img_size
         self.patch_size = self.Encoder.patch_size
         self.num_layers = self.Encoder.depth
         self.embed_dim = self.Encoder.embed_dim
         self.head_dim = self.Encoder.head_dim
-
+        
+        # 创建BERT配置用于MLM头
         bert_config = BertConfig(
             vocab_size=config_dict["vocab_size"],
             hidden_size=self.embed_dim,
             hidden_dropout_prob=config_dict["drop_path_rate"],
         )
         
+        # 创建MLM评分头
         self.mlm_score = heads.MLMHead(bert_config)
         self.mlm_score.apply(objectives.init_weights)
+
+        # 设置文本预训练的评估指标
         vlmo_utils.set_metrics_for_text_pretraining(self)
+
+        # 加载预训练权重并进行参数冻结设置
         self.setup_stage_weights_and_freezing()
     
-    def _internal_convert_beit2_to_textpt(self, source_state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def _internal_convert_vision_to_textpt(self, source_state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Internal version of convert_to_textpt_ckpt.
-        Converts BEiT2-like vision weights to VLMo Text Pretraining (MoE) architecture.
-        Returns a state_dict with keys directly mappable to self.Encoder components (e.g., "blocks.0...")
-        and self.mlm_score components (e.g., "predictions...").
+        将视觉预训练权重转换为文本预训练MoE架构的权重。
+        将单个MLP的权重复制到所有MoE专家中，同时保留patch_embed（包含注意力）。
+        
+        Args:
+            source_state_dict: 视觉预训练模型的状态字典
+            
+        Returns:
+            转换后的状态字典，可直接加载到当前模型
         """
         new_state_dict = {}
+        actual_vocab_size = self.hparams.actual_vocab_size
         rank_zero_info("VLMoForTextPretraining: Converting Vision Pretrained (single MLP) checkpoint for Text Pretraining (MoE)...")
 
+        # 统计转换信息
         skipped_keys_count = 0
         mapped_mlp_keys_count = 0
-        mapped_norm1_keys_count = 0
-        mapped_norm2_keys_count = 0
+        mapped_attention_keys_count = 0
+        mapped_norm_keys_count = 0
+        mapped_embedding_keys_count = 0
         other_mapped_keys_count = 0
 
         if not hasattr(self, 'Encoder') or not hasattr(self.Encoder, 'blocks') or not self.Encoder.blocks:
-            rank_zero_info("  Error: self.Encoder.blocks not found or empty. Cannot determine num_experts. Aborting conversion.")
-            # Return a processed version of source_state_dict without actual conversion of structure
-            # This part might need more careful handling if conversion is critical and structure is missing
-            processed_raw = {}
-            for k, v in source_state_dict.items():
-                name = k
-                if name.startswith("model.encoder."): name = name[len("model.encoder."):]
-                elif name.startswith("encoder."): name = name[len("encoder."):]
-                elif name.startswith("model."): name = name[len("model."):]
-                elif name.startswith("module."): name = name[len("module."):]
-                processed_raw[name] = v
-            return processed_raw
+            rank_zero_info("Error: Encoder or blocks not found in current model!")
+
+        # 获取当前模型的MoE配置信息
+        try:
+            first_block = self.Encoder.blocks[0]
+            if hasattr(first_block, 'mlp') and hasattr(first_block.mlp, 'experts'):
+                num_experts = first_block.mlp.experts
+                rank_zero_info(f"Target model has {num_experts} experts per layer")
+            else:
+                num_experts = self.config["model_arch"].get("num_experts", 4)
+                rank_zero_info(f"Using config MoE: {num_experts} experts per layer")
+        except Exception as e:
+            num_experts = self.config["model_arch"].get("num_experts", 4)
+            rank_zero_info(f"Error determining MoE structure: {e}")
 
         for key, value in source_state_dict.items():
-            base_key = key
-            if key.startswith("model.encoder."):
-                base_key = key[len("model.encoder."):]
-            elif key.startswith("encoder."):
-                base_key = key[len("encoder."):]
-            elif key.startswith("model."): # General model prefix if others don't match
-                base_key = key[len("model."):]
-            # Do not strip "module." here, allow it to be handled by generic loader if conversion fails early
-
-
-            if "mlp" in base_key and base_key.startswith("blocks."):
-                parts = base_key.split(".")
-                if len(parts) == 5 and parts[2] == "mlp" and parts[3] in ["fc1", "fc2"]:
-                    try:
-                        block_idx = int(parts[1])
-                        mlp_layer_name = parts[3]
-                        param_type = parts[4]
-
-                        if not (0 <= block_idx < len(self.Encoder.blocks)):
-                            skipped_keys_count += 1; continue
-                        
-                        num_experts_in_block = self.Encoder.blocks[block_idx].num_experts
-
-                        if num_experts_in_block > 1: # MoE Case
-                            for expert_idx in range(num_experts_in_block):
-                                if mlp_layer_name == "fc1":
-                                    new_state_dict[f"blocks.{block_idx}.moe_block.experts.{expert_idx}.gate_proj.{param_type}"] = value.clone()
-                                    new_state_dict[f"blocks.{block_idx}.moe_block.experts.{expert_idx}.up_proj.{param_type}"] = value.clone()
-                                elif mlp_layer_name == "fc2":
-                                    new_state_dict[f"blocks.{block_idx}.moe_block.experts.{expert_idx}.down_proj.{param_type}"] = value.clone()
-                        else: # Single MLP Case
-                            if mlp_layer_name == "fc1":
-                                new_state_dict[f"blocks.{block_idx}.moe_block.up_proj.{param_type}"] = value.clone()
-                            elif mlp_layer_name == "fc2":
-                                new_state_dict[f"blocks.{block_idx}.moe_block.down_proj.{param_type}"] = value.clone()
+            # 跳过vocab相关的权重，因为vocab_size可能不匹配
+            if "word_embeddings" in key:
+                source_vocab_size = value.shape[0] if len(value.shape) > 0 else 0
+                if source_vocab_size != actual_vocab_size:
+                    rank_zero_info(f"Skipping {key}: source vocab_size={source_vocab_size}, target vocab_size={actual_vocab_size}")
+                    skipped_keys_count += 1
+                    continue
+                else:
+                    rank_zero_info(f"Mapping {key}: vocab sizes match ({actual_vocab_size})")
+                    new_state_dict[key] = value
+                    mapped_embedding_keys_count += 1
+                    continue
+            
+            # 跳过其他可能依赖vocab_size的组件
+            if any(vocab_key in key for vocab_key in ["mlm_score", "lm_head", "predictions", "classifier"]):
+                # 检查是否是vocab相关的权重
+                if len(value.shape) > 0 and value.shape[0] == actual_vocab_size:
+                    rank_zero_info(f"Mapping vocab-related {key}: shapes compatible")
+                    new_state_dict[key] = value
+                    mapped_embedding_keys_count += 1
+                elif len(value.shape) > 0 and value.shape[-1] == actual_vocab_size:
+                    rank_zero_info(f"Mapping vocab-related {key}: output dim compatible")
+                    new_state_dict[key] = value
+                    mapped_embedding_keys_count += 1
+                else:
+                    rank_zero_info(f"Skipping {key}: shape {value.shape} not compatible with dynamic vocab_size={actual_vocab_size}")
+                    skipped_keys_count += 1
+                continue
+            
+            # 处理MLP -> MoE转换
+            if ".mlp." in key and "experts" not in key:
+                # 这是单个MLP的权重，需要复制到所有专家
+                layer_match = None
+                for i in range(len(self.Encoder.blocks)):
+                    if f".blocks.{i}.mlp." in key:
+                        layer_match = i
+                        break
+                
+                if layer_match is not None:
+                    # 提取MLP权重类型（如fc1.weight, fc2.weight等）
+                    mlp_weight_name = key.split(f".blocks.{layer_match}.mlp.")[-1]
+                    
+                    # 复制到所有专家
+                    for expert_idx in range(num_experts):
+                        new_key = key.replace(f".blocks.{layer_match}.mlp.", f".blocks.{layer_match}.mlp.experts.{expert_idx}.")
+                        new_state_dict[new_key] = value.clone()
                         mapped_mlp_keys_count += 1
-                        continue
-                    except Exception as e:
-                        rank_zero_info(f"  Warning: Error processing MLP key {key} (as {base_key}): {e}. Treating as other key.")
+                    
+                    rank_zero_info(f"Converted MLP {key} to {num_experts} experts")
+                    continue
             
-            elif "norm2" in base_key and base_key.startswith("blocks."): # MLP's norm
-                parts = base_key.split(".")
-                if len(parts) == 4 and parts[2] == "norm2":
-                    try:
-                        block_idx = int(parts[1]); param_type = parts[3]
-                        new_state_dict[f"blocks.{block_idx}.post_attention_layernorm.{param_type}"] = value
-                        mapped_norm2_keys_count += 1; continue
-                    except Exception as e: rank_zero_info(f"  Warning: Error processing norm2 key {key}: {e}.")
+            # 处理注意力层权重
+            if any(attn_key in key for attn_key in [".attn.", ".attention.", ".self_attn."]):
+                new_state_dict[key] = value
+                mapped_attention_keys_count += 1
+                continue
+            
+            # 处理归一化层权重
+            if any(norm_key in key for norm_key in [".norm.", ".layernorm.", ".layer_norm."]):
+                new_state_dict[key] = value
+                mapped_norm_keys_count += 1
+                continue
+            
+            # 处理token type embeddings
+            if "token_type_embeddings" in key:
+                new_state_dict[key] = value
+                mapped_embedding_keys_count += 1
+                continue
+            
+            # 处理其他权重（patch_embed, cls_token, position embeddings等）
+            if any(other_key in key for other_key in ["patch_embed", "cls_token", "pos_embed", "rope"]):
+                new_state_dict[key] = value
+                other_mapped_keys_count += 1
+                continue
+            
+            # 跳过MLM相关的权重（这些是新任务特定的）
+            if any(skip_key in key for skip_key in ["mlm_score", "classifier", "pooler"]):
+                rank_zero_info(f"Skipping task-specific weight: {key}")
+                skipped_keys_count += 1
+                continue
+            
+            # 其他未匹配的权重
+            rank_zero_info(f"Unhandled key: {key}")
+            skipped_keys_count += 1
 
-            elif "norm1" in base_key and base_key.startswith("blocks."): # Attention's norm
-                parts = base_key.split(".")
-                if len(parts) == 4 and parts[2] == "norm1":
-                    try:
-                        block_idx = int(parts[1]); param_type = parts[3]
-                        new_state_dict[f"blocks.{block_idx}.input_layernorm.{param_type}"] = value
-                        mapped_norm1_keys_count += 1; continue
-                    except Exception as e: rank_zero_info(f"  Warning: Error processing norm1 key {key}: {e}.")
-            
-            # For other keys (patch_embed, cls_token, attn weights within blocks)
-            # base_key should now be like "patch_embed.proj.weight", "cls_token", "blocks.0.attn.q_proj.weight"
-            if base_key not in new_state_dict: # Avoid overwriting if a more specific rule already handled part of it
-                new_state_dict[base_key] = value
-                other_mapped_keys_count +=1
-        rank_zero_info(f"Conversion summary: MLP layers mapped: {mapped_mlp_keys_count}, Norm1 mapped: {mapped_norm1_keys_count}, Norm2 mapped: {mapped_norm2_keys_count}, Other keys mapped: {other_mapped_keys_count}, Skipped: {skipped_keys_count}")
+        rank_zero_info(f"Conversion summary:")
+        rank_zero_info(f"  - MLP layers converted to MoE: {mapped_mlp_keys_count}")
+        rank_zero_info(f"  - Attention layers mapped: {mapped_attention_keys_count}")
+        rank_zero_info(f"  - Norm layers mapped: {mapped_norm_keys_count}")
+        rank_zero_info(f"  - Embedding layers mapped: {mapped_embedding_keys_count}")
+        rank_zero_info(f"  - Other keys mapped: {other_mapped_keys_count}")
+        rank_zero_info(f"  - Keys skipped: {skipped_keys_count}")
+        
         return new_state_dict
-    
+        
     
     def setup_stage_weights_and_freezing(self):
-        load_path = self.hparams.config.get("load_path", "")
-        if not load_path or self.hparams.config.get("test_only", False):
-            rank_zero_info("No load_path or in test_only mode, skipping weight loading/freezing.")
+        """
+        设置阶段权重加载和参数冻结策略
+        """
+        load_path = self.hparams.config.get("weight_path", "")
+        if not load_path:
+            rank_zero_info("VLMoForTextPretraining: No weight path provided, using random initialization")
+            self._apply_parameter_freezing()
             return
 
         rank_zero_info(f"VLMoForTextPretraining: Loading checkpoint from {load_path}")
         try:
             ckpt = torch.load(load_path, map_location="cpu")
         except Exception as e:
-            rank_zero_info(f"Error loading checkpoint from {load_path}: {e}")
+            rank_zero_info(f"Error loading checkpoint: {e}")
+            self._apply_parameter_freezing()
             return
 
+        # 获取state_dict
         raw_state_dict = ckpt.get("state_dict", ckpt.get("module", ckpt.get("model", ckpt)))
         if raw_state_dict is None:
-            rank_zero_info(f"Could not find a valid state_dict in {load_path}")
+            rank_zero_info("Error: No state_dict found in checkpoint")
+            self._apply_parameter_freezing()
             return
 
-        processed_sd = {} # This will hold keys stripped of common prefixes, ready for matching
-        
-        # Determine if conversion is needed and perform it
-        # The textmlm task is implicitly active for VLMoForTextPretraining
-        needs_conversion = self.hparams.config.get("convert_beit2_to_textpt", False)
-        
-        if needs_conversion:
-            rank_zero_info("VLMoForTextPretraining: Converting source BEiT2-like checkpoint.")
-            # _internal_convert_beit2_to_textpt returns keys directly usable by self.Encoder components
-            # e.g., "blocks.0.attn.q_proj.weight"
-            processed_sd = self._internal_convert_beit2_to_textpt(raw_state_dict)
-        else:
-            # No conversion, just strip common prefixes from raw_state_dict
-            # Aim to get keys like "blocks.0.attn.q_proj.weight" for encoder,
-            # and "predictions.bias" for mlm_score.
-            temp_sd_for_processing = {}
-            for k, v in raw_state_dict.items():
-                name = k
-                # Strip prefixes in order of specificity
-                if name.startswith("model.Encoder."): name = name[len("model.Encoder."):]
-                elif name.startswith("Encoder."): name = name[len("Encoder."):]
-                elif name.startswith("model.transformer."): name = name[len("model.transformer."):]
-                elif name.startswith("transformer."): name = name[len("transformer."):]
-                elif name.startswith("model.mlm_score."): name = name[len("model.mlm_score."):]
-                elif name.startswith("mlm_score."): name = name[len("mlm_score."):]
-                elif name.startswith("model."): name = name[len("model."):]
-                elif name.startswith("module."): name = name[len("module."):]
-                temp_sd_for_processing[name] = v
-            processed_sd = temp_sd_for_processing
-            rank_zero_info("VLMoForTextPretraining: Loaded checkpoint without BEiT2 conversion path.")
-
-        # Load into Encoder
+        # 执行权重转换（从视觉预训练到文本预训练MoE）
+        rank_zero_info("Converting vision pretrained weights for text pretraining with MoE...")
+        processed_sd = self._internal_convert_vision_to_textpt(raw_state_dict)
+         # 加载到Encoder
         encoder_model_dict = self.Encoder.state_dict()
         final_encoder_sd_to_load = {
             k: v for k, v in processed_sd.items()
             if k in encoder_model_dict and encoder_model_dict[k].shape == v.shape
         }
-        if final_encoder_sd_to_load:
-            missing_e, unexpected_e = self.Encoder.load_state_dict(final_encoder_sd_to_load, strict=False)
-            rank_zero_info(f"Encoder weights loaded. Missing: {len(missing_e)} ({missing_e[:5]}), Unexpected: {len(unexpected_e)} ({unexpected_e[:5]})")
-        else:
-            rank_zero_info("No matching weights found for Encoder in processed checkpoint.")
-
-        # Load into MLM Head
-        mlm_model_dict = self.mlm_score.state_dict()
-        final_mlm_sd_to_load = {
-            k: v for k, v in processed_sd.items() # Assumes keys in processed_sd for mlm_score are already stripped (e.g. "predictions.bias")
-            if k in mlm_model_dict and mlm_model_dict[k].shape == v.shape
-        }
-        if final_mlm_sd_to_load:
-            missing_m, unexpected_m = self.mlm_score.load_state_dict(final_mlm_sd_to_load, strict=False)
-            rank_zero_info(f"MLM Head weights loaded. Missing: {len(missing_m)} ({missing_m[:5]}), Unexpected: {len(unexpected_m)} ({unexpected_m[:5]})")
-        else:
-            rank_zero_info("No matching weights found for MLM Head in processed checkpoint.")
         
-        # Parameter Freezing Logic (largely unchanged)
-        rank_zero_info("VLMoForTextPretraining: Applying parameter freezing for text pretraining stage.")
+        if final_encoder_sd_to_load:
+            missing_keys, unexpected_keys = self.Encoder.load_state_dict(final_encoder_sd_to_load, strict=False)
+            rank_zero_info(f"Encoder loaded {len(final_encoder_sd_to_load)} weights successfully")
+            if missing_keys:
+                rank_zero_info(f"Missing Encoder keys: {len(missing_keys)} (some expected for new components)")
+            if unexpected_keys:
+                rank_zero_info(f"Unexpected Encoder keys: {len(unexpected_keys)}")
+        else:
+            rank_zero_info("Warning: No compatible weights found for Encoder")
+
+        # MLM头保持随机初始化（因为是新任务）
+        rank_zero_info("MLM head keeps random initialization for new text pretraining task")
+        
+        # 应用参数冻结策略
+        self._apply_parameter_freezing()
+        
+
+    def _apply_parameter_freezing(self):
+        """
+        应用参数冻结策略：冻结注意力层，解冻MoE层
+        """
+        rank_zero_info("VLMoForTextPretraining: Applying parameter freezing strategy")
+        
+        # 首先冻结所有参数
         for param in self.parameters():
             param.requires_grad = False
 
-        # Keywords for unfreezing. Note: self.named_parameters() will have 'Encoder.' and 'mlm_score.' prefixes.
+        # 需要解冻的组件关键词
         unfreeze_keywords = [
+            # 文本嵌入相关（新增组件）
             "Encoder.word_embeddings.",
             "Encoder.token_type_embeddings.",
-            "Encoder.blocks.",  # This should unfreeze all params within blocks including attn, norms, MoE parts.
+            
+            # MoE相关参数（主要训练目标）
+            "moe_block.experts.",
+            "moe_block.gate.",
+            
+            # MLM头（新任务头）
             "mlm_score.",
-            "Encoder.norm.", # Final norm of the encoder
+            
+            # 最终归一化层（可能需要适应新任务）
+            "Encoder.norm.",
+            
+            # Layer Scale参数（FFN部分，与MoE相关）
+            ".gamma_ffn",
         ]
+        
+        # 可选解冻的组件（根据配置决定）
+        if self.hparams.config.get("unfreeze_post_attention_layernorm", True):
+            unfreeze_keywords.append("post_attention_layernorm.")
         
         rank_zero_info(f"Attempting to unfreeze parameters containing keywords: {unfreeze_keywords}")
         unfrozen_count = 0
+        frozen_count = 0
+        
         for name, param in self.named_parameters():
-            is_unfrozen = False
-            for key_prefix in unfreeze_keywords:
-                if name.startswith(key_prefix):
-                    param.requires_grad = True
-                    is_unfrozen = True
-                    unfrozen_count += 1
-                    break
-            # The more granular checks below are redundant if "Encoder.blocks." unfreezes everything within.
-            # Kept for explicitness or if "Encoder.blocks." behavior changes.
-            if not is_unfrozen and name.startswith("Encoder.blocks."):
-                # Check for specific components if "Encoder.blocks." itself wasn't enough or for fine-grained control
-                if ".moe_block.experts." in name or \
-                   ".moe_block.gate." in name or \
-                   ".input_layernorm." in name or \
-                   ".post_attention_layernorm." in name or \
-                   name.endswith(".gamma_sa") or \
-                   name.endswith(".gamma_ffn") or \
-                   ".attn." in name: # Ensure attention mechanism parameters are trainable
-                    if not param.requires_grad: # Avoid double counting if already unfrozen by "Encoder.blocks."
-                        param.requires_grad = True
-                        unfrozen_count +=1
-                        is_unfrozen = True # Mark as processed
+            should_unfreeze = any(keyword in name for keyword in unfreeze_keywords)
+            
+            if should_unfreeze:
+                param.requires_grad = True
+                unfrozen_count += 1
+                # 可选：打印解冻的重要参数
+                if any(important in name for important in ["moe_block", "mlm_score", "word_embeddings"]):
+                    rank_zero_info(f"  Unfrozen: {name}")
+            else:
+                frozen_count += 1
+                # 可选：打印冻结的注意力参数示例
+                if "attn." in name and frozen_count <= 5:  # 只打印前几个示例
+                    rank_zero_info(f"  Frozen (attention): {name}")
 
-        rank_zero_info(f"Total parameters unfrozen: {unfrozen_count}")
+        rank_zero_info(f"Parameter freezing summary:")
+        rank_zero_info(f"  - Total parameters unfrozen: {unfrozen_count}")
+        rank_zero_info(f"  - Total parameters frozen: {frozen_count}")
+        rank_zero_info(f"  - Strategy: Focus on MoE training while keeping attention frozen")
 
     def forward(self, batch):
         text_ids = batch["text_ids_mlm"]
@@ -262,7 +422,7 @@ class VLMoForTextPretraining(pl.LightningModule):
         encoder_outputs = self.Encoder(
             input_ids=text_ids,
             text_mask=text_masks, 
-            image_tensor=None,
+            image_tensor=None, # 纯文本预训练阶段不使用图像
             output_router_logits=True,
         )
         text_feats = encoder_outputs.last_hidden_state
@@ -271,6 +431,9 @@ class VLMoForTextPretraining(pl.LightningModule):
         return {"logits": mlm_logits, "labels": text_labels_mlm, "text_ids": text_ids, "encoder_outputs_obj": encoder_outputs}
     
     def training_step(self, batch, batch_idx):
+        """
+        训练步骤
+        """
         self.current_batch_size = batch["text_ids_mlm"].size(0)
         outputs = self.forward(batch)
         mlm_logits = outputs["logits"]
@@ -301,7 +464,6 @@ class VLMoForTextPretraining(pl.LightningModule):
             mask = mlm_labels != -100
             if mask.sum() > 0:
                  acc_metric.update(preds[mask], mlm_labels[mask])
-            self.log(f"train/textmlm_accuracy", acc_metric, prog_bar=False, logger=True, on_step=False, on_epoch=True)
 
         return total_loss
     
@@ -337,59 +499,697 @@ class VLMoForTextPretraining(pl.LightningModule):
             mask = mlm_labels != -100
             if mask.sum() > 0:
                  acc_metric.update(preds[mask], mlm_labels[mask])
-            # 确保这里的 log key 与 epoch_wrapup_for_text_pretraining 中期望的一致
-            self.log(f"val/{vlmo_utils.TEXT_PRETRAIN_METRIC_NAME}", acc_metric, prog_bar=True, logger=True, on_step=False, on_epoch=True)
-        
         
         return total_loss
     
     def on_validation_epoch_end(self):
+        """
+        验证周期结束时的处理
+        """
         vlmo_utils.epoch_wrapup_for_text_pretraining(self)
         train_acc_metric = getattr(self, f"train_{vlmo_utils.TEXT_PRETRAIN_METRIC_NAME}", None)
         val_acc_metric = getattr(self, f"val_{vlmo_utils.TEXT_PRETRAIN_METRIC_NAME}", None)
+
+        if train_acc_metric:
+            train_acc_metric.reset()
+        if val_acc_metric:
+            val_acc_metric.reset()
 
 
     @staticmethod
     def _layer_moe_losses(router_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        router_logits: (B*N, num_experts)
-        return (balance_loss, router_z_loss)
+        计算单层的MoE损失（平衡损失和路由器Z损失）
+        
+        Args:
+            router_logits: 路由器的logits，形状为 (batch_size*sequence_length, num_experts)
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: (balance_loss, router_z_loss)
         """
-        num_experts = router_logits.size(-1)
-        probs = router_logits.float().softmax(dim=-1)                     # (tokens, E)
 
-        # ① balance loss：鼓励不同专家被均匀选中
-        expert_mean = probs.mean(dim=0)                                   # (E,)
-        balance_loss = ((expert_mean - 1.0 / num_experts) ** 2).sum()
+        num_experts = router_logits.size(-1)   
+        
+        if num_experts == 1:
+            return torch.tensor(0.0, device=router_logits.device), torch.tensor(0.0, device=router_logits.device)                             # (E,)
+        
+        gates = F.softmax(router_logits, dim=-1)
 
-        # ② router-Z loss：鼓励每个 token 的分布接近均匀（可理解为负熵 / KL）
-        uniform = torch.full_like(probs, 1.0 / num_experts)
-        router_z_loss = F.kl_div(probs.log(), uniform, reduction="batchmean")
+        # 负载均衡损失
+        density = gates.mean(dim=0)
+        balance_loss = (density * num_experts).pow(2).sum()
 
+        # 路由器z损失（稀疏性损失）
+        router_z_loss = router_logits.pow(2).mean()
+        
         return balance_loss, router_z_loss
     
     def compute_moe_aux_loss_from_router_logits(
         self, router_logits_tuple: Tuple[torch.Tensor, ...]
     ) -> torch.Tensor:
+        """
+        从路由器logits元组计算MoE辅助损失
+        
+        Args:
+            router_logits_tuple: 所有层的路由器logits元组
+            
+        Returns:
+            torch.Tensor: 总的MoE辅助损失
+        """
+        if not router_logits_tuple:
+            return torch.tensor(0.0, device=self.device)
+        
         balance_loss_total = 0.0
         router_z_loss_total = 0.0
+
         for layer_logits in router_logits_tuple:                # 遍历所有层
-            bl, zl = self._layer_moe_losses(layer_logits)
-            balance_loss_total += bl
-            router_z_loss_total += zl
+            balance_loss, router_z_loss = self._layer_moe_losses(layer_logits)
+            balance_loss_total += balance_loss
+            router_z_loss_total += router_z_loss
+
         n_layer = len(router_logits_tuple)
         balance_loss_avg = balance_loss_total / n_layer
         router_z_loss_avg = router_z_loss_total / n_layer
 
         coef_b = self.hparams.config.get("moe_balance_loss_weight", 0.01)
         coef_z = self.hparams.config.get("moe_router_z_loss_weight", 0.001)
-        return coef_b * balance_loss_avg + coef_z * router_z_loss_avg
+        
+        total_aux_loss = coef_b * balance_loss_avg + coef_z * router_z_loss_avg
+
+        # 记录详细的MoE损失信息
+        self.log("train/moe_balance_loss", balance_loss_avg, prog_bar=False, logger=True, sync_dist=True)
+        self.log("train/moe_router_z_loss", router_z_loss_avg, prog_bar=False, logger=True, sync_dist=True)
+        
+        return total_aux_loss
 
 
     def configure_optimizers(self):
+        """
+        配置优化器和学习率调度器
+        """
         return vlmo_utils.set_schedule_for_MLM(self) # Assuming set_schedule can work with self.hparams
 
 
+class VLMoForVisionLanguagePretraining(pl.LightningModule):
+    def __init__(self, config_dict: dict):
+        super().__init__()
+        
+        # 第一步：动态加载tokenizer并获取vocab_size
+        tokenizer_path = config_dict.get("tokenizer")
+        if not tokenizer_path:
+            raise ValueError("VisionLanguagePretraining requires 'tokenizer' configuration")
+        
+        rank_zero_info("VLMoForVisionLanguagePretraining: Loading tokenizer to determine vocab_size...")
+        self.tokenizer, actual_vocab_size = load_tokenizer_with_vocab_size(
+            tokenizer_path, 
+            use_distributed_loading=False
+        )
+        
+        # 第二步：更新config_dict和model_arch
+        config_dict = config_dict.copy()
+        config_dict["vocab_size"] = actual_vocab_size
+        
+        model_arch = config_dict.get("model_arch", {})
+        model_arch = update_model_arch_with_vocab_size(model_arch, actual_vocab_size)
+        config_dict["model_arch"] = model_arch
+        
+        # 第三步：保存超参数
+        self.save_hyperparameters({
+            "config": config_dict,
+            "actual_vocab_size": actual_vocab_size,
+            "tokenizer_path": tokenizer_path
+        })
+        self.config = config_dict
+
+
+        # 第四步：创建编码器
+        model_arch = config_dict.get("model_arch", {})
+        self.Encoder = TransformerEncoder(
+            img_size=model_arch.get("img_size", 384),
+            patch_size=model_arch.get("patch_size", 16),
+            in_chans=model_arch.get("in_chans", 3),
+            embed_dim=model_arch.get("embed_dim", 512),
+            depth=model_arch.get("depth", 6),
+            num_heads=model_arch.get("num_heads", 8),
+            num_kv_heads=model_arch.get("num_kv_heads", 8),
+            qkv_bias=model_arch.get("qkv_bias", False),
+            qk_scale=model_arch.get("qk_scale", None),
+            attn_drop_rate=model_arch.get("attn_drop_rate", 0.0),
+            drop_path_rate=model_arch.get("drop_path_rate", 0.1),
+            norm_eps=model_arch.get("norm_eps", 1e-6),
+            layer_scale_init_values=model_arch.get("layer_scale_init_values", 0.01),
+            init_std=model_arch.get("init_std", 0.02),
+            # MoE参数
+            num_experts=model_arch.get("num_experts", 4),
+            num_experts_per_tok=model_arch.get("num_experts_per_tok", 2),
+            mlp_ratio=model_arch.get("mlp_ratio", 4.0),
+            norm_topk_prob=model_arch.get("norm_topk_prob", True),
+            moe_hidden_act=model_arch.get("moe_hidden_act", "silu"),
+            # RoPE参数
+            max_seq_len=config_dict.get("max_text_len", 196),
+            rope_base=model_arch.get("rope_base", 10000),
+            # Token Type参数
+            num_token_types=model_arch.get("num_token_types", 2),
+            vocab_size=actual_vocab_size,
+            padding_idx=model_arch.get("padding_idx", 0),
+        )
+        
+        # 获取模型属性
+        self.activation = self.Encoder.moe_hidden_act
+        self.img_size = self.Encoder.img_size
+        self.patch_size = self.Encoder.patch_size
+        self.num_layers = self.Encoder.depth
+        self.embed_dim = self.Encoder.embed_dim
+        self.head_dim = self.Encoder.head_dim
+        
+        # 第五步：创建各种头部，使用动态vocab_size
+        # 池化层
+        self.pooler = heads.Pooler(self.embed_dim)
+        
+        # 创建ITC头
+        self.itc_text_proj = heads.ITCHead(self.embed_dim)
+        self.itc_image_proj = heads.ITCHead(self.embed_dim)
+
+        # 可学习的温度参数
+        self.logit_scale = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(1/0.07)))
+        
+        # MLM头部（使用动态vocab_size）
+        bert_config = BertConfig(
+            vocab_size=actual_vocab_size,
+            hidden_size=self.embed_dim,
+            hidden_dropout_prob=config_dict.get("drop_path_rate", 0.1),
+        )
+        self.mlm_score = heads.MLMHead(bert_config)
+        
+        # 交叉模态解码器和MLM头部
+        decoder_config = config_dict
+        self.cross_modal_decoder = CrossModalDecoder(
+            dim=self.embed_dim,
+            context_dim=self.embed_dim,  # 图像和文本embed_dim相同
+            depth=decoder_config.get("decoder_depth", 2),
+            num_heads=decoder_config.get("num_heads", 8),
+            num_kv_heads=decoder_config.get("num_kv_heads", 8),
+            qkv_bias=decoder_config.get("qkv_bias", False),
+            qk_scale=decoder_config.get("qk_scale", None),
+            attn_drop=decoder_config.get("attn_drop_rate", 0.0),
+            drop_path_rate=decoder_config.get("drop_path_rate", 0.1),
+            norm_eps=decoder_config.get("norm_eps", 1e-6),
+            layer_scale_init_values=decoder_config.get("layer_scale_init_values", 0.01),
+            # MoE参数
+            num_experts=model_arch.get("decoder_num_experts", 4),
+            num_experts_per_tok=model_arch.get("decoder_num_experts_per_tok", 2),
+            mlp_ratio=model_arch.get("mlp_ratio", 4.0),
+            norm_topk_prob=model_arch.get("norm_topk_prob", True),
+            moe_hidden_act=model_arch.get("moe_hidden_act", "silu"),
+        )
+        
+        # 交叉模态MLM预测头
+        self.cross_modal_mlm_score = CrossModalMLMHead(
+            hidden_size=self.embed_dim,
+            vocab_size=actual_vocab_size,
+            hidden_act=model_arch.get("moe_hidden_act", "silu"),
+            layer_norm_eps=model_arch.get("norm_eps", 1e-6),
+        )
+        
+        # 初始化权重
+        self.mlm_score.apply(objectives.init_weights)
+        
+        # 设置评估指标
+        vlmo_utils.set_metrics_for_vision_language_pretraining(self)
+        
+        # 加载预训练权重
+        self.setup_stage_weights_and_freezing()
+    
+    def setup_stage_weights_and_freezing(self):
+        """设置权重加载策略"""
+        load_path = self.hparams.config.get("weight_path", "")
+        if not load_path:
+            rank_zero_info("VLMoForVisionLanguagePretraining: No weight path provided, using random initialization")
+            return
+
+        rank_zero_info(f"VLMoForVisionLanguagePretraining: Loading checkpoint from {load_path}")
+        try:
+            ckpt = torch.load(load_path, map_location="cpu")
+ 
+            # 获取state_dict
+            raw_state_dict = ckpt.get("state_dict", ckpt.get("module", ckpt.get("model", ckpt)))
+            if raw_state_dict is None:
+                rank_zero_info("Error: No state_dict found in checkpoint")
+                return
+
+            # 过滤兼容的权重（检查vocab_size一致性）
+            model_dict = self.state_dict()
+            compatible_state_dict = {}
+            for k, v in raw_state_dict.items():
+                if k in model_dict:
+                    if model_dict[k].shape == v.shape:
+                        compatible_state_dict[k] = v
+                    else:
+                        # 特别处理vocab相关的权重
+                        if "word_embeddings" in k or "mlm_score" in k:
+                            source_vocab_size = v.shape[0] if len(v.shape) > 0 else 0
+                            target_vocab_size = self.hparams.actual_vocab_size
+                            rank_zero_info(f"Skipping {k}: shape mismatch - source: {v.shape}, target: {model_dict[k].shape}")
+                            rank_zero_info(f"  vocab_size difference: source={source_vocab_size}, target={target_vocab_size}")
+                        else:
+                            rank_zero_info(f"Skipping {k}: shape mismatch - {v.shape} vs {model_dict[k].shape}")
+            
+            if compatible_state_dict:
+                missing_keys, unexpected_keys = self.load_state_dict(compatible_state_dict, strict=False)
+                rank_zero_info(f"Loaded {len(compatible_state_dict)} compatible weights")
+                if missing_keys:
+                    rank_zero_info(f"Missing keys: {len(missing_keys)} (expected for new components)")
+                if unexpected_keys:
+                    rank_zero_info(f"Unexpected keys: {len(unexpected_keys)}")
+            else:
+                rank_zero_info("No compatible weights found")
+                
+        except Exception as e:
+            rank_zero_info(f"Failed to load checkpoint: {e}")
+        
+    def infer(
+        self,
+        batch,
+        mask_text=False,
+        mask_image=False,
+        image_token_type_idx=1,
+        image_embeds=None,
+        image_masks=None,
+    ):
+
+        text_ids = batch["text_ids"]
+        text_masks = batch["text_masks"]
+        images = batch["image"][0] if isinstance(batch["image"], list) else batch["image"]
+
+        encoder_outputs = self.Encoder(
+            input_ids=text_ids,
+            text_mask=text_masks,
+            image_tensor=images,
+            output_router_logits=True,
+        )
+        
+        co_embeds = encoder_outputs.last_hidden_state
+        
+        # 分离图像和文本特征
+        text_len = text_ids.shape[1]
+        text_feats = co_embeds[:, :text_len]
+        image_feats = co_embeds[:, text_len:]
+        
+        # CLS特征用于对比学习
+        cls_feats = self.pooler(co_embeds)
+        
+        ret = {
+            "text_feats": text_feats,
+            "image_feats": image_feats,
+            "cls_feats": cls_feats,
+            "text_ids": text_ids,
+            "text_masks": text_masks,
+            "encoder_outputs": encoder_outputs,
+        }
+        
+        if mask_text:
+            ret["text_labels"] = batch["text_labels_mlm"]
+        
+        return ret
+    
+    def infer_image(
+        self,
+        batch,
+        mask_image=False,
+        image_token_type_idx=1,
+        image_embeds=None,
+        image_masks=None,
+    ):
+        images = batch["image"][0] if isinstance(batch["image"], list) else batch["image"]
+        
+        encoder_outputs = self.Encoder(
+            input_ids=None,
+            text_mask=None,
+            image_tensor=images,
+            output_router_logits=True,
+        )
+        
+        image_feats = encoder_outputs.last_hidden_state
+        cls_feats = self.pooler(image_feats)
+        
+        return {
+            "image_feats": image_feats,
+            "cls_feats": cls_feats,
+            "encoder_outputs": encoder_outputs,
+        }
+
+    def infer_text(
+        self,
+        batch,
+        mask_text=False,
+    ):
+        """推理纯文本"""
+        text_ids = batch["text_ids"]
+        text_masks = batch["text_masks"]
+        
+        encoder_outputs = self.Encoder(
+            input_ids=text_ids,
+            text_mask=text_masks,
+            image_tensor=None,
+            output_router_logits=True,
+        )
+        
+        text_feats = encoder_outputs.last_hidden_state
+        cls_feats = self.pooler(text_feats)
+        
+        ret = {
+            "text_feats": text_feats,
+            "cls_feats": cls_feats,
+            "text_ids": text_ids,
+            "text_masks": text_masks,
+            "encoder_outputs": encoder_outputs,
+        }
+        
+        if mask_text:
+            ret["text_labels"] = batch["text_labels_mlm"]
+        
+        return ret
+
+    def infer_cross_modal_mlm(self, batch):
+        """
+        执行交叉模态MLM推理
+        图像嵌入作为键值，被掩码的语言嵌入作为查询
+        """
+        # 首先获取图像和文本的独立表示
+        image_outputs = self.infer_image(batch)
+        text_outputs = self.infer_text(batch, mask_text=True)
+        
+        # 使用交叉模态解码器
+        decoder_outputs = self.cross_modal_decoder(
+            hidden_states=text_outputs["text_feats"],  # 查询
+            context=image_outputs["image_feats"],      # 键值
+            output_router_logits=True,
+        )
+        
+        enhanced_text_feats = decoder_outputs[0]
+        
+        return {
+            "enhanced_text_feats": enhanced_text_feats,
+            "text_labels": text_outputs["text_labels"],
+            "text_ids": text_outputs["text_ids"],
+            "text_masks": text_outputs["text_masks"],
+            "decoder_outputs": decoder_outputs,
+        }
+
+    def forward(self, batch):
+        """
+        前向传播，包含ITC + 交叉模态MLM
+        """
+        outputs = {}
+        
+        # ITC损失
+        image_outputs = self.infer_image(batch)
+        text_outputs = self.infer_text(batch)
+        
+        image_proj_feats = self.itc_image_proj(image_outputs["cls_feats"])
+        text_proj_feats = self.itc_text_proj(text_outputs["cls_feats"])
+        
+        # 归一化特征
+        image_proj_feats = F.normalize(image_proj_feats, p=2, dim=-1)
+        text_proj_feats = F.normalize(text_proj_feats, p=2, dim=-1)
+        
+        outputs.update({
+            "image_proj_feats": image_proj_feats,
+            "text_proj_feats": text_proj_feats,
+            "image_encoder_outputs": image_outputs["encoder_outputs"],
+            "text_encoder_outputs": text_outputs["encoder_outputs"],
+        })
+        
+        # MLM损失（标准）
+        if "text_labels_mlm" in batch:
+            text_mlm_outputs = self.infer_text(batch, mask_text=True)
+            mlm_logits = self.mlm_score(text_mlm_outputs["text_feats"])
+            outputs.update({
+                "mlm_logits": mlm_logits,
+                "mlm_labels": text_mlm_outputs["text_labels"],
+                "mlm_encoder_outputs": text_mlm_outputs["encoder_outputs"],
+            })
+        
+        # 交叉模态MLM损失
+        cross_modal_outputs = self.infer_cross_modal_mlm(batch)
+        cross_modal_mlm_logits = self.cross_modal_mlm_score(cross_modal_outputs["enhanced_text_feats"])
+        outputs.update({
+            "cross_modal_mlm_logits": cross_modal_mlm_logits,
+            "cross_modal_mlm_labels": cross_modal_outputs["text_labels"],
+            "cross_modal_decoder_outputs": cross_modal_outputs["decoder_outputs"],
+        })
+        
+        return outputs
+
+    def training_step(self, batch, batch_idx):
+        """训练步骤"""
+        self.current_batch_size = batch["text_ids"].size(0)
+        outputs = self.forward(batch)
+        
+        total_loss = 0.0
+        loss_dict = {}
+        
+        # 1. ITC损失
+        if "itc_logits_i2t" in outputs and "itc_logits_t2i" in outputs:
+            itc_i2t_logits = outputs["itc_logits_i2t"]
+            itc_t2i_logits = outputs["itc_logits_t2i"]
+            
+            # 使用SigLIP损失或标准对比损失
+            if self.config.get("use_siglip_loss", False):
+                itc_loss = self.compute_siglip_loss(itc_i2t_logits, itc_t2i_logits)
+            else:
+                itc_loss = self.compute_contrastive_loss(itc_i2t_logits, itc_t2i_logits)
+            
+            itc_weight = self.config.get("itc_loss_weight", 1.0)
+            total_loss += itc_weight * itc_loss
+            loss_dict["itc_loss"] = itc_loss
+        
+        # 2. 交叉模态MLM损失
+        if "cross_modal_mlm_logits" in outputs and "text_labels" in outputs:
+            cross_modal_mlm_logits = outputs["cross_modal_mlm_logits"]
+            mlm_labels = outputs["text_labels"]
+            
+            cross_modal_mlm_loss = F.cross_entropy(
+                cross_modal_mlm_logits.reshape(-1, self.config["vocab_size"]),
+                mlm_labels.reshape(-1),
+                ignore_index=-100,
+            )
+            
+            # 根据你的描述，交叉熵损失权重为0.1
+            cross_modal_mlm_weight = self.config.get("cross_modal_mlm_weight", 0.1)
+            total_loss += cross_modal_mlm_weight * cross_modal_mlm_loss
+            loss_dict["cross_modal_mlm_loss"] = cross_modal_mlm_loss
+        
+        # 3. MoE辅助损失
+        moe_aux_loss = self.compute_moe_aux_loss_from_outputs(outputs)
+        if moe_aux_loss is not None:
+            total_loss += moe_aux_loss
+            loss_dict["moe_aux_loss"] = moe_aux_loss
+        
+        # 记录损失
+        for loss_name, loss_value in loss_dict.items():
+            self.log(f"train/{loss_name}", loss_value, prog_bar=False, logger=True, sync_dist=True)
+        
+        self.log("train/total_loss", total_loss, prog_bar=True, logger=True, sync_dist=True)
+        
+        # 记录准确率
+        self._log_accuracies(outputs, "train")
+        
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        """验证步骤"""
+        self.current_batch_size = batch["text_ids"].size(0)
+        outputs = self.forward(batch)
+        
+        total_loss = 0.0
+        loss_dict = {}
+        
+        # 计算ITC损失
+        if "itc_logits_i2t" in outputs and "itc_logits_t2i" in outputs:
+            itc_i2t_logits = outputs["itc_logits_i2t"]
+            itc_t2i_logits = outputs["itc_logits_t2i"]
+            
+            if self.config.get("use_siglip_loss", False):
+                itc_loss = self.compute_siglip_loss(itc_i2t_logits, itc_t2i_logits)
+            else:
+                itc_loss = self.compute_contrastive_loss(itc_i2t_logits, itc_t2i_logits)
+            
+            itc_weight = self.config.get("itc_loss_weight", 1.0)
+            total_loss += itc_weight * itc_loss
+            loss_dict["itc_loss"] = itc_loss
+        
+        # 计算交叉模态MLM损失
+        if "cross_modal_mlm_logits" in outputs and "text_labels" in outputs:
+            cross_modal_mlm_logits = outputs["cross_modal_mlm_logits"]
+            mlm_labels = outputs["text_labels"]
+            
+            cross_modal_mlm_loss = F.cross_entropy(
+                cross_modal_mlm_logits.reshape(-1, self.config["vocab_size"]),
+                mlm_labels.reshape(-1),
+                ignore_index=-100,
+            )
+            
+            cross_modal_mlm_weight = self.config.get("cross_modal_mlm_weight", 0.1)
+            total_loss += cross_modal_mlm_weight * cross_modal_mlm_loss
+            loss_dict["cross_modal_mlm_loss"] = cross_modal_mlm_loss
+        
+        # MoE辅助损失
+        moe_aux_loss = self.compute_moe_aux_loss_from_outputs(outputs)
+        if moe_aux_loss is not None:
+            total_loss += moe_aux_loss
+            loss_dict["moe_aux_loss"] = moe_aux_loss
+        
+        # 记录验证损失
+        for loss_name, loss_value in loss_dict.items():
+            self.log(f"val/{loss_name}", loss_value, prog_bar=False, logger=True, sync_dist=True)
+        
+        self.log("val/total_loss", total_loss, prog_bar=True, logger=True, sync_dist=True)
+        
+        # 记录准确率
+        self._log_accuracies(outputs, "val")
+
+        return total_loss
+
+    def _log_accuracies(self, outputs, phase):
+        """记录准确率指标"""
+        # ITC准确率
+        if "itc_logits_i2t" in outputs and "itc_logits_t2i" in outputs:
+            itc_i2t_logits = outputs["itc_logits_i2t"]
+            itc_t2i_logits = outputs["itc_logits_t2i"]
+            
+            # 计算准确率
+            labels = torch.arange(itc_i2t_logits.size(0), device=itc_i2t_logits.device)
+            
+            i2t_preds = itc_i2t_logits.argmax(dim=-1)
+            t2i_preds = itc_t2i_logits.argmax(dim=-1)
+            
+            # 更新指标
+            i2t_metric = getattr(self, f"{phase}_{vlmo_utils.VL_PRETRAIN_ITC_I2T_METRIC_NAME}", None)
+            t2i_metric = getattr(self, f"{phase}_{vlmo_utils.VL_PRETRAIN_ITC_T2I_METRIC_NAME}", None)
+            
+            if i2t_metric:
+                i2t_metric.update(i2t_preds, labels)
+                self.log(f"{phase}/{vlmo_utils.VL_PRETRAIN_ITC_I2T_METRIC_NAME}", i2t_metric, 
+                        prog_bar=False, logger=True, on_step=False, on_epoch=True)
+            
+            if t2i_metric:
+                t2i_metric.update(t2i_preds, labels)
+                self.log(f"{phase}/{vlmo_utils.VL_PRETRAIN_ITC_T2I_METRIC_NAME}", t2i_metric,
+                        prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        
+        # 交叉模态MLM准确率
+        if "cross_modal_mlm_logits" in outputs and "text_labels" in outputs:
+            cross_modal_mlm_logits = outputs["cross_modal_mlm_logits"]
+            mlm_labels = outputs["text_labels"]
+            
+            if mlm_labels is not None:
+                cross_modal_preds = cross_modal_mlm_logits.argmax(dim=-1)
+                mask = mlm_labels != -100
+                
+                if mask.sum() > 0:
+                    cross_modal_metric = getattr(self, f"{phase}_{vlmo_utils.VL_PRETRAIN_CROSS_MODAL_MLM_METRIC_NAME}", None)
+                    if cross_modal_metric:
+                        cross_modal_metric.update(cross_modal_preds[mask], mlm_labels[mask])
+                        self.log(f"{phase}/{vlmo_utils.VL_PRETRAIN_CROSS_MODAL_MLM_METRIC_NAME}", cross_modal_metric,
+                                prog_bar=False, logger=True, on_step=False, on_epoch=True)
+
+    def on_validation_epoch_end(self):
+        """验证周期结束时的处理"""
+        vlmo_utils.epoch_wrapup_for_vision_language_pretraining(self)
+
+    def compute_moe_aux_loss_from_outputs(self, outputs):
+        """从输出中计算MoE辅助损失"""
+        moe_aux_loss = torch.tensor(0.0, device=self.device)
+        
+        # 解码器MoE损失
+        if "decoder_outputs" in outputs:
+            decoder_outputs = outputs["decoder_outputs"]
+            if len(decoder_outputs) > 2:  # 包含router_logits
+                decoder_router_logits = decoder_outputs[2]  # 假设是第三个输出
+                if decoder_router_logits:
+                    decoder_moe_loss = self.compute_moe_aux_loss_from_router_logits(decoder_router_logits)
+                    moe_aux_loss += decoder_moe_loss
+        
+        return moe_aux_loss if moe_aux_loss > 0 else None
+
+    def compute_moe_aux_loss_from_router_logits(self, router_logits_tuple):
+        """从路由器logits计算MoE损失"""
+        if not router_logits_tuple:
+            return torch.tensor(0.0, device=self.device)
+        
+        balance_loss_total = 0.0
+        router_z_loss_total = 0.0
+        
+        for layer_logits in router_logits_tuple:
+            if layer_logits is not None:
+                balance_loss, router_z_loss = self._layer_moe_losses(layer_logits)
+                balance_loss_total += balance_loss
+                router_z_loss_total += router_z_loss
+        
+        n_layer = len(router_logits_tuple)
+        if n_layer > 0:
+            balance_loss_avg = balance_loss_total / n_layer
+            router_z_loss_avg = router_z_loss_total / n_layer
+        else:
+            balance_loss_avg = router_z_loss_avg = 0.0
+        
+        coef_b = self.config.get("moe_balance_loss_weight", 0.01)
+        coef_z = self.config.get("moe_router_z_loss_weight", 0.001)
+        
+        return coef_b * balance_loss_avg + coef_z * router_z_loss_avg
+
+    @staticmethod
+    def _layer_moe_losses(router_logits):
+        """计算单层MoE损失"""
+        if router_logits is None:
+            return torch.tensor(0.0), torch.tensor(0.0)
+        
+        # Balance loss
+        if router_logits.numel() == 0:
+            return torch.tensor(0.0), torch.tensor(0.0)
+        
+        probs = F.softmax(router_logits, dim=-1)
+        num_experts = probs.size(-1)
+        
+        # 计算每个专家的负载
+        counts = probs.sum(dim=0)
+        route_prob_max = probs.max(dim=-1)[0]
+        
+        # Balance loss: 鼓励负载均衡
+        balance_loss = num_experts * torch.sum(counts * route_prob_max) / counts.sum()
+        
+        # Router z-loss: 正则化路由器输出
+        router_z_loss = torch.mean(torch.logsumexp(router_logits, dim=-1) ** 2)
+        
+        return balance_loss, router_z_loss
+
+    def compute_siglip_loss(self, logits_i2t, logits_t2i):
+        """计算SigLIP损失"""
+        # SigLIP使用sigmoid而不是softmax
+        batch_size = logits_i2t.size(0)
+        
+        # 创建目标矩阵
+        targets = torch.eye(batch_size, device=logits_i2t.device)
+        
+        # SigLIP损失
+        loss_i2t = F.binary_cross_entropy_with_logits(logits_i2t, targets)
+        loss_t2i = F.binary_cross_entropy_with_logits(logits_t2i.T, targets)
+        
+        return (loss_i2t + loss_t2i) / 2.0
+
+    def compute_contrastive_loss(self, logits_i2t, logits_t2i):
+        """计算标准对比损失"""
+        labels = torch.arange(logits_i2t.size(0), device=logits_i2t.device)
+        
+        loss_i2t = F.cross_entropy(logits_i2t, labels)
+        loss_t2i = F.cross_entropy(logits_t2i, labels)
+        
+        return (loss_i2t + loss_t2i) / 2.0
+
+    def configure_optimizers(self):
+        """配置优化器"""
+        return vlmo_utils.set_schedule_for_vision_language_pretraining(self)
 
 # 用于构建和训练一个视觉 - 语言多模态模型
 class VLMo(pl.LightningModule):

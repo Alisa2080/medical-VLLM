@@ -1,4 +1,4 @@
-from vlmo.datasets import PMCDataset # 确保 PMCDataset 在 datasets 目录下或可被导入
+from datasets.multimodal_datasets import PMCDataset # 确保 PMCDataset 在 datasets 目录下或可被导入
 from .datamodule_base import BaseDataModule
 
 

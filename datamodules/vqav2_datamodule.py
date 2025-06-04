@@ -1,4 +1,4 @@
-from vlmo.datasets import VQAv2Dataset
+from datasets.multimodal_datasets.vqav2_dataset import VQAv2Dataset
 from .datamodule_base import BaseDataModule
 from collections import defaultdict
 

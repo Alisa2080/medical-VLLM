@@ -1,4 +1,4 @@
-from vlmo.datasets import ConceptualCaptionDataset
+from datasets.multimodal_datasets import ConceptualCaptionDataset
 from .datamodule_base import BaseDataModule
 
 

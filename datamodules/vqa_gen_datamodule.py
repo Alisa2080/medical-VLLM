@@ -4,8 +4,8 @@ from transformers import BertTokenizerFast
 from functools import partial
 
 # Import necessary components
-from vlmo.data.vqa_gen_dataset import VQAGenDataset, collate_fn_vqa_gen
-from vlmo.data.transforms import create_image_transform # Assuming transforms are defined here
+from datasets.multimodal_datasets.vqa_gen_dataset import VQAGenDataset, collate_fn_vqa_gen
+from datasets.multimodal_datasets.transforms import create_image_transform # Assuming transforms are defined here
 
 class VQAGenDataModule(pl.LightningDataModule):
     """

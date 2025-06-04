@@ -1,4 +1,4 @@
-from vlmo.datasets import CocoCaptionKarpathyDataset
+from datasets.multimodal_datasets.coco_caption_karpathy_dataset import CocoCaptionKarpathyDataset
 from .datamodule_base import BaseDataModule
 
 

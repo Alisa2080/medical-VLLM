@@ -6,7 +6,7 @@ from .sbu_datamodule import SBUCaptionDataModule
 from .wikibk_datamodule import WikibkDataModule
 from .vqav2_datamodule import VQAv2DataModule
 from .nlvr2_datamodule import NLVR2DataModule
-
+from .PMCDataModule import PMCDataModule
 _datamodules = {
     "vg": VisualGenomeCaptionDataModule,
     "f30k": F30KCaptionKarpathyDataModule,
@@ -15,5 +15,6 @@ _datamodules = {
     "sbu": SBUCaptionDataModule,
     "wikibk": WikibkDataModule,
     "vqa": VQAv2DataModule,
+    "pmc": PMCDataModule,
     "nlvr2": NLVR2DataModule,
 }

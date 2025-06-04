@@ -1,4 +1,4 @@
-from vlmo.datasets import SBUCaptionDataset
+from datasets.multimodal_datasets import SBUCaptionDataset
 from .datamodule_base import BaseDataModule
 
 

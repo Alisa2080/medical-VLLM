@@ -1,4 +1,4 @@
-from vlmo.datasets import WikibkDataset
+from datasets.multimodal_datasets import WikibkDataset
 from .datamodule_base import BaseDataModule
 
 

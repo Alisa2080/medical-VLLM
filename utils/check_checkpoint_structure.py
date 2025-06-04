@@ -24,11 +24,6 @@ def inspect_checkpoint(checkpoint_path):
             state_dict = checkpoint['state_dict']
             for i, (key, value) in enumerate(state_dict.items()):
                 print(f"  - {key}: \t{value.shape}, \tdtype: {value.dtype}")
-                if i < 20: # 打印前20个权重键以避免输出过长
-                    pass
-                elif i == 20:
-                    print(f"  ... (and {len(state_dict) - 20} more keys)")
-                    break
             print("-" * 40)
         else:
             print("\n'state_dict' key not found. The checkpoint might directly contain weights or have a different structure.")

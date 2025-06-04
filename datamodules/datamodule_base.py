@@ -6,12 +6,13 @@ from transformers import (
     DataCollatorForLanguageModeling,
     DataCollatorForWholeWordMask,
     BertTokenizer,
+    AutoTokenizer,
 )
-
+from pytorch_lightning.utilities import rank_zero_info
 
 def get_pretrained_tokenizer(from_pretrained):
     """
-    从预训练模型加载Bert分词器。
+    从预训练模型加载分词器，支持动态vocab_size获取。
 
     如果使用分布式训练，只有rank为0的进程会首先加载分词器，
     其他进程会等待rank为0的进程加载完成后再加载。
@@ -20,20 +21,37 @@ def get_pretrained_tokenizer(from_pretrained):
     from_pretrained (str): 预训练模型的名称或路径。
 
     返回:
-    BertTokenizer: 加载好的Bert分词器。
+    tokenizer: 加载好的分词器实例
     """
     # 检查是否使用分布式训练
-    print(f"torch.distributed.is_initialized():{torch.distributed.is_initialized()}")
-    print(f"加载文本tokenizer,tokenizer的路径为:{from_pretrained}")
+    rank_zero_info(f"torch.distributed.is_initialized(): {torch.distributed.is_initialized()}")
+    rank_zero_info(f"加载文本tokenizer，tokenizer的路径为: {from_pretrained}")
+    
     if torch.distributed.is_initialized():
         # 如果当前进程的rank为0
         if torch.distributed.get_rank() == 0:
-            # 从预训练模型加载Bert分词器，根据预训练模型名称判断是否进行小写转换
-            BertTokenizer.from_pretrained(from_pretrained)
+            rank_zero_info("Rank 0: Loading tokenizer...")
+            try:
+                # 优先使用AutoTokenizer，兼容更多模型
+                AutoTokenizer.from_pretrained(from_pretrained)
+            except Exception as e:
+                rank_zero_info(f"AutoTokenizer failed, trying BertTokenizer: {e}")
+                BertTokenizer.from_pretrained(from_pretrained)
+        
         # 所有进程在此处同步，确保rank为0的进程加载完成后其他进程再继续
         torch.distributed.barrier()
-    # 从预训练模型加载Bert分词器，根据预训练模型名称判断是否进行小写转换
-    return BertTokenizer.from_pretrained(from_pretrained)
+    
+    # 加载分词器
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(from_pretrained)
+    except Exception as e:
+        rank_zero_info(f"AutoTokenizer failed, trying BertTokenizer: {e}")
+        tokenizer = BertTokenizer.from_pretrained(from_pretrained)
+    
+    vocab_size = tokenizer.vocab_size
+    rank_zero_info(f"Successfully loaded tokenizer with vocab_size: {vocab_size}")
+    
+    return tokenizer
 
 
 class BaseDataModule(LightningDataModule):

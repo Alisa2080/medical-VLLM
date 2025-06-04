@@ -4,7 +4,7 @@ from transformers import BertTokenizer
 from functools import partial
 
 # Import necessary components
-from vlmo.data.text_qa_dataset import TextQADataset, collate_fn_text_qa
+from datasets.multimodal_datasets.text_qa_dataset import TextQADataset, collate_fn_text_qa
 
 class TextQADataModule(pl.LightningDataModule):
     """

@@ -1,4 +1,4 @@
-from vlmo.datasets import VisualGenomeCaptionDataset
+from datasets.multimodal_datasets import VisualGenomeCaptionDataset
 from .datamodule_base import BaseDataModule
 
 
