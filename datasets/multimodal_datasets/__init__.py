@@ -6,3 +6,4 @@ from .sbu_caption_dataset import SBUCaptionDataset
 from .wikibk_dataset import WikibkDataset
 from .vqav2_dataset import VQAv2Dataset
 from .nlvr2_dataset import NLVR2Dataset
+from .PMCDataset import PMCDataset  # 确保从 PMCDataset.py 文件导入 PMCDataset 类

@@ -1,4 +1,4 @@
-from vlmo.datasets import NLVR2Dataset
+from datasets.multimodal_datasets import NLVR2Dataset
 from .datamodule_base import BaseDataModule
 
 

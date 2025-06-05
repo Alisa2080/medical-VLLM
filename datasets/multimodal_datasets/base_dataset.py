@@ -3,16 +3,15 @@ import torch
 import io
 import pyarrow as pa
 import os
-
+from typing import Callable, Optional
 from PIL import Image
-from vlmo.transforms import keys_to_transforms
 
 
 class BaseDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         data_dir: str,
-        transform_keys: list,
+        image_augmentation: Callable,
         image_size: int,
         names: list,
         text_column_name: str = "",
@@ -27,7 +26,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         参数:
         data_dir (str): 数据集文件所在的目录，文件应为 .arrow 格式。
-        transform_keys (list): 用于生成图像增强视图的键列表。
+        image_augmentation (Callable): 图像增强器，直接接收PIL图像并返回增强后的tensor。
         image_size (int): 图像的大小。
         names (list): 数据集的名称列表。
         text_column_name (str, 可选): pyarrow 表中包含字符串列表的列名。默认为 ""。
@@ -37,13 +36,13 @@ class BaseDataset(torch.utils.data.Dataset):
         draw_false_text (int, 可选): 抽取的虚假文本数量。默认为 0。
         image_only (bool, 可选): 是否仅使用图像数据。默认为 False。
         """
-        # 确保 transform_keys 列表至少有一个元素
-        assert len(transform_keys) >= 1
         # 调用父类的构造函数
         super().__init__()
 
-        # 根据 transform_keys 和 image_size 生成图像变换列表
-        self.transforms = keys_to_transforms(transform_keys, size=image_size)
+        # 保存图像增强器
+        self.image_augmentation = image_augmentation
+        # 存储图像大小
+        self.image_size = image_size
         # 存储文本列的名称
         self.text_column_name = text_column_name
         # 存储数据集的名称列表
@@ -66,7 +65,6 @@ class BaseDataset(torch.utils.data.Dataset):
             tables = []
             for name in names:
                 file_path = f"{data_dir}/{name}.arrow"
-                # print(f"Checking file: {file_path}")
                 if os.path.isfile(file_path):
                     try:
                         table = pa.ipc.RecordBatchFileReader(pa.memory_map(file_path, "r")).read_all()
@@ -79,9 +77,6 @@ class BaseDataset(torch.utils.data.Dataset):
             names = valid_names
             self.names = names
         
-            # print(f"names的长度为{len(names)},tables的长度为{len(tables)}")
-            # for name in names:
-                #  print(f"{name}.arrow 存在")
             # 初始化表名列表
             self.table_names = list()
             # 遍历所有名称
@@ -147,8 +142,41 @@ class BaseDataset(torch.utils.data.Dataset):
         return Image.open(image_bytes).convert("RGB")
 
     def get_image(self, index, image_key="image"):
+        """
+        获取增强后的图像
+        
+        Args:
+            index: 数据索引
+            image_key: 图像列名
+            
+        Returns:
+            dict: 包含增强后图像tensor和相关信息的字典
+        """
         image = self.get_raw_image(index, image_key=image_key)
-        image_tensor = [tr(image) for tr in self.transforms]
+        
+        # 使用增强器处理图像
+        try:
+            image_tensor = self.image_augmentation(image)
+            
+            # 确保返回的是tensor，如果增强器返回多个视图，取第一个
+            if isinstance(image_tensor, (list, tuple)):
+                image_tensor = image_tensor[0]
+            
+            # 如果需要包装成列表以保持与原有接口的兼容性
+            if not isinstance(image_tensor, list):
+                image_tensor = [image_tensor]
+                
+        except Exception as e:
+            print(f"Image augmentation failed for index {index}: {e}")
+            # 降级处理：简单resize和normalize
+            import torchvision.transforms as T
+            fallback_transform = T.Compose([
+                T.Resize((self.image_size, self.image_size)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            image_tensor = [fallback_transform(image)]
+        
         return {
             "image": image_tensor,
             "img_index": self.index_mapper[index][0],
@@ -157,9 +185,42 @@ class BaseDataset(torch.utils.data.Dataset):
         }
 
     def get_false_image(self, rep, image_key="image"):
+        """
+        获取随机的虚假图像
+        
+        Args:
+            rep: 重复次数标识
+            image_key: 图像列名
+            
+        Returns:
+            dict: 包含虚假图像tensor的字典
+        """
         random_index = random.randint(0, len(self.index_mapper) - 1)
         image = self.get_raw_image(random_index, image_key=image_key)
-        image_tensor = [tr(image) for tr in self.transforms]
+        
+        # 使用增强器处理虚假图像
+        try:
+            image_tensor = self.image_augmentation(image)
+            
+            # 确保返回的是tensor，如果增强器返回多个视图，取第一个
+            if isinstance(image_tensor, (list, tuple)):
+                image_tensor = image_tensor[0]
+            
+            # 包装成列表以保持兼容性
+            if not isinstance(image_tensor, list):
+                image_tensor = [image_tensor]
+                
+        except Exception as e:
+            print(f"False image augmentation failed: {e}")
+            # 降级处理
+            import torchvision.transforms as T
+            fallback_transform = T.Compose([
+                T.Resize((self.image_size, self.image_size)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            image_tensor = [fallback_transform(image)]
+        
         return {f"false_image_{rep}": image_tensor}
 
     def get_text(self, raw_index):
@@ -214,7 +275,6 @@ class BaseDataset(torch.utils.data.Dataset):
                 index = random.randint(0, len(self.index_mapper) - 1)
         return ret
 
-
     def get_text_suite(self, index):
         result = None
         while result is None:
@@ -228,7 +288,6 @@ class BaseDataset(torch.utils.data.Dataset):
                 print(f"Error while read file idx {index} in {self.names[0]} -> {e}")
                 index = random.randint(0, len(self.index_mapper) - 1)
         return ret
-
 
     def collate(self, batch, mlm_collator):
         batch_size = len(batch)
@@ -267,7 +326,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 for _i, encoding in enumerate(encodings):
                     _input_ids, _attention_mask = (
                         torch.tensor(encoding["input_ids"]),
-                        torch.tensor(encoding["attention_mask"]),
+                        torch.tensor(encoding["attention_mask"], dtype=torch.bool),  # 修改：强制使用布尔类型
                     )
                     input_ids[_i, : len(_input_ids)] = _input_ids
                     attention_mask[_i, : len(_attention_mask)] = _attention_mask
@@ -277,6 +336,6 @@ class BaseDataset(torch.utils.data.Dataset):
                 dict_batch[f"{txt_key}_labels"] = torch.full_like(input_ids, -100)
                 dict_batch[f"{txt_key}_ids_mlm"] = mlm_ids
                 dict_batch[f"{txt_key}_labels_mlm"] = mlm_labels
-                dict_batch[f"{txt_key}_masks"] = attention_mask
+                dict_batch[f"{txt_key}_masks"] = attention_mask.bool()  # 修改：确保attention_mask是布尔类型
 
         return dict_batch

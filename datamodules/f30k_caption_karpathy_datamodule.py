@@ -1,4 +1,4 @@
-from vlmo.datasets import F30KCaptionKarpathyDataset
+from datasets.multimodal_datasets import F30KCaptionKarpathyDataset
 from .datamodule_base import BaseDataModule
 
 

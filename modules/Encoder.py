@@ -137,26 +137,26 @@ class TransformerEncoder(nn.Module):
     def no_weight_decay(self):
         return {"pos_embed", "cls_token"}
 
-    def visual_embed(self, image_tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def visual_embed(self, image_tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden_states = self.patch_embed(image_tensor)
         input_size = hidden_states.shape[:1]
 
         cls_tokens = self.cls_token.expand(input_size[0], -1, -1)
         image_hidden_states = torch.cat((cls_tokens, hidden_states), dim=1)
         num_img_tokens = image_hidden_states.shape[1]
-        image_mask = torch.ones(input_size[0], num_img_tokens, dtype=torch.bool, device=image_hidden_states.device)
+        image_mask = torch.ones(input_size[0], num_img_tokens, dtype=torch.bool, device=image_hidden_states.device)  # 确保是布尔类型
         image_pos_ids = torch.arange(num_img_tokens, dtype=torch.long, device=image_hidden_states.device).unsqueeze(0).expand(input_size[0], -1)
         return image_hidden_states, image_mask, image_pos_ids
         
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None, # Shape (B, N_text, C)
-        text_mask: Optional[torch.Tensor] = None,    # Bool mask (B, N_text), True=VALID
-        image_tensor: Optional[torch.Tensor] = None, # Raw image (B, C_in, H_img, W_img)
-        attention_mask: Optional[torch.Tensor] = None, # Optional precomputed combined mask
+        input_ids: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
+        image_tensor: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-        output_hidden_states: bool = False, # Not implemented in detail here
-        output_router_logits: bool = False, # Control returning logits
+        output_hidden_states: bool = False,
+        output_router_logits: bool = False,
         **kwargs
     ):
         output_attentions = output_attentions if output_attentions is not None else False
@@ -171,31 +171,34 @@ class TransformerEncoder(nn.Module):
             text_word_embeds = self.word_embeddings(input_ids)
             N_text_actual = input_ids.shape[1]
             text_pos_ids = torch.arange(N_text_actual, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
-        
+    
             text_type_ids = torch.zeros_like(input_ids, dtype=torch.long)    
             text_token_type_embeds = self.token_type_embeddings(text_type_ids)
             text_embeds = text_word_embeds + text_token_type_embeds    
-            
+        
             cos_text, sin_text = self.rope1d(text_embeds, text_pos_ids)    
-            
+        
             co_embeds_list.append(text_embeds)
 
             if text_mask is None:
                 text_mask = torch.ones_like(input_ids, dtype=torch.bool)
+            else:
+                # 确保text_mask是布尔类型
+                text_mask = text_mask.bool()
             co_masks_list.append(text_mask)
-  
+
             N_text_actual = text_embeds.shape[1]
-        
-        
+    
+    
         image_embeds, image_mask, image_pos_ids = None, None, None
         if image_tensor is not None:
             image_embeds, image_mask, image_pos_ids = self.visual_embed(image_tensor)
             if self.token_type_embeddings is not None:
                 image_type_idx = 1 if self.num_token_types > 1 and text_embeds is not None else 0
-            
+        
                 image_embeds = image_embeds + self.token_type_embeddings(
-                 torch.full_like(image_mask, image_type_idx, dtype=torch.long) # Type 1 for image
-            )
+                torch.full_like(image_mask, image_type_idx, dtype=torch.long) # Type 1 for image
+            )   
             co_embeds_list.append(image_embeds)
             co_masks_list.append(image_mask)
 
@@ -208,11 +211,14 @@ class TransformerEncoder(nn.Module):
         attention_mask_for_block: Optional[torch.Tensor] = None
         if attention_mask is None:
             co_masks = torch.cat(co_masks_list, dim=1) # (B, N), assuming mask is 1 for valid, 0 for pad
+            # 确保co_masks是布尔类型
+            co_masks = co_masks.bool()
+        
             # Create 4D float mask (0/-inf) expected by attention layers
             # This basic version assumes full attention between all valid tokens
             attention_mask_for_block = torch.zeros_like(co_masks, dtype=co_embeds.dtype)
             attention_mask_for_block.masked_fill_(~co_masks, torch.finfo(co_embeds.dtype).min)
-            
+        
             if attention_mask_for_block.ndim == 2:
                 attention_mask_for_block = attention_mask_for_block.unsqueeze(1).unsqueeze(2) # (B, 1, 1, N_total)
             elif attention_mask_for_block.ndim == 3: # Should not happen with co_masks
@@ -223,7 +229,7 @@ class TransformerEncoder(nn.Module):
                 attention_mask_for_block.masked_fill_(~attention_mask, torch.finfo(co_embeds.dtype).min)
             else:
                 attention_mask_for_block = attention_mask
-        
+    
         if attention_mask_for_block is not None:
             if attention_mask_for_block.ndim == 2: # (B, N_total)
                 attention_mask_for_block = attention_mask_for_block.unsqueeze(1).unsqueeze(2)
@@ -237,13 +243,14 @@ class TransformerEncoder(nn.Module):
 
         hidden_states = co_embeds
         for i, block in enumerate(self.blocks):
-            
+        
             if output_hidden_states: 
-                all_hidden_states.append(hidden_states,)
-            
-            hidden_states = block(
+                all_hidden_states.append(hidden_states)
+        
+            # 修复：正确处理block的返回值
+            block_output_tuple = block(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask, 
+                attention_mask=attention_mask_for_block,  # 修复：使用正确计算的attention_mask_for_block
                 N_text=N_text_actual if text_embeds is not None else 0,
                 cos=cos_text,
                 sin=sin_text,
@@ -254,18 +261,22 @@ class TransformerEncoder(nn.Module):
                 output_router_logits=output_router_logits,
             )
 
-            hidden_states = hidden_states[0]
+            # 提取processed hidden states用于下一层
+            hidden_states = block_output_tuple[0]
+        
+            # 从完整的输出元组中提取其他输出
             current_output_idx = 1
             if output_attentions:
-                all_block_attentions.append(hidden_states[current_output_idx])
+                all_block_attentions.append(block_output_tuple[current_output_idx])
                 current_output_idx += 1
             if output_router_logits:
-                all_block_router_logits.append(hidden_states[current_output_idx])
+                all_block_router_logits.append(block_output_tuple[current_output_idx])
 
         # 5. Final Norm
         last_hidden_states = self.norm(hidden_states)
         if output_hidden_states: 
-                all_hidden_states.append(hidden_states,)   
+            all_hidden_states.append(last_hidden_states)   
+    
         # 6. Return results
         return MoEModelOutput( 
             last_hidden_state=last_hidden_states,

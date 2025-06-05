@@ -1,5 +1,4 @@
 import torch
-
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
 from transformers import (
@@ -9,6 +8,7 @@ from transformers import (
     AutoTokenizer,
 )
 from pytorch_lightning.utilities import rank_zero_info
+from transforms.Pathogram_Transformation import PathologyAugmentation
 
 def get_pretrained_tokenizer(from_pretrained):
     """
@@ -75,53 +75,131 @@ class BaseDataModule(LightningDataModule):
         # 评估时的批量大小与训练时相同
         self.eval_batch_size = self.batch_size
 
-        # 从配置中获取图像的大小
-        self.image_size = _config["image_size"]
+        # 统一获取图像尺寸 - 支持多种参数名以确保兼容性
+        self.image_size = self._get_image_size_from_config(_config)
+        
         # 从配置中获取最大文本长度
-        self.max_text_len = _config["max_text_len"]
+        self.max_text_len = _config.get("max_text_len", 196)
         # 从配置中获取随机抽取错误图像的数量
-        self.draw_false_image = _config["draw_false_image"]
+        self.draw_false_image = _config.get("draw_false_image", 0)
         # 从配置中获取随机抽取错误文本的数量
-        self.draw_false_text = _config["draw_false_text"]
+        self.draw_false_text = _config.get("draw_false_text", 0)
         # 从配置中获取是否仅使用图像的标志
-        self.image_only = _config["image_only"]
+        self.image_only = _config.get("image_only", False)
         # 从配置中获取是否仅使用文本的标志
-        self.text_only = _config["text_only"]
-
-        # 如果训练转换键列表为空，则使用默认的训练转换键
-        self.train_transform_keys = (
-            ["default_train"]
-            if len(_config["train_transform_keys"]) == 0
-            else _config["train_transform_keys"]
-        )
-
-        # 如果验证转换键列表为空，则使用默认的验证转换键
-        self.val_transform_keys = (
-            ["default_val"]
-            if len(_config["val_transform_keys"]) == 0
-            else _config["val_transform_keys"]
-        )
+        self.text_only = _config.get("text_only", False)
 
         # 从配置中获取分词器的名称或路径
-        tokenizer = _config["tokenizer"]
-        # 从预训练模型加载分词器
-        self.tokenizer = get_pretrained_tokenizer(tokenizer)
-        # 获取分词器的词汇表大小
+        tokenizer_path = _config.get("tokenizer")
+        if not tokenizer_path:
+            raise ValueError("Configuration must contain 'tokenizer' field for dynamic vocab_size determination")
+        
+        rank_zero_info(f"BaseDataModule: Loading tokenizer from {tokenizer_path}")
+        # 从预训练模型加载分词器（动态获取vocab_size）
+        self.tokenizer = get_pretrained_tokenizer(tokenizer_path)
+        
+        # 动态获取分词器的词汇表大小
         self.vocab_size = self.tokenizer.vocab_size
+        rank_zero_info(f"BaseDataModule: Dynamic vocab_size determined as {self.vocab_size}")
+        
+        # 验证vocab_size的合理性
+        if self.vocab_size <= 0:
+            raise ValueError(f"Invalid vocab_size: {self.vocab_size}. Tokenizer may not be loaded correctly.")
 
         # 根据配置选择数据整理器
         collator = (
             DataCollatorForWholeWordMask
-            if _config["whole_word_masking"]
+            if _config.get("whole_word_masking", False)
             else DataCollatorForLanguageModeling
         )
 
         # 初始化用于掩码语言模型的数据整理器
         self.mlm_collator = collator(
-            tokenizer=self.tokenizer, mlm=True, mlm_probability=_config["mlm_prob"]
+            tokenizer=self.tokenizer, 
+            mlm=True, 
+            mlm_probability=_config.get("mlm_prob", 0.15)
         )
+        
+        # 创建图像增强器
+        self._setup_image_augmentations(_config)
+        
         # 设置数据加载器的设置标志为False
         self.setup_flag = False
+        
+        rank_zero_info(f"BaseDataModule initialized successfully:")
+        rank_zero_info(f"  - Tokenizer: {tokenizer_path}")
+        rank_zero_info(f"  - Vocab size: {self.vocab_size}")
+        rank_zero_info(f"  - Image size: {self.image_size}")
+        rank_zero_info(f"  - Max text length: {self.max_text_len}")
+        rank_zero_info(f"  - MLM probability: {_config.get('mlm_prob', 0.15)}")
+        rank_zero_info(f"  - Whole word masking: {_config.get('whole_word_masking', False)}")
+        rank_zero_info(f"  - Text only: {self.text_only}")
+        rank_zero_info(f"  - Image only: {self.image_only}")
+
+    def _get_image_size_from_config(self, _config):
+        """
+        统一获取图像尺寸，支持多种参数名以确保向后兼容性
+        
+        Args:
+            _config: 配置字典
+            
+        Returns:
+            int: 图像尺寸
+        """
+        # 优先使用顶级的 image_size
+        if "image_size" in _config:
+            return _config["image_size"]
+        
+        # 检查 image_augmentation 中的 image_size
+        image_aug_config = _config.get("image_augmentation", {})
+        if "image_size" in image_aug_config:
+            rank_zero_info("Using image_size from image_augmentation config")
+            return image_aug_config["image_size"]
+        
+        # 向后兼容：检查 image_augmentation 中的 input_size
+        if "input_size" in image_aug_config:
+            rank_zero_info("Warning: Using deprecated 'input_size' from image_augmentation, please use 'image_size' instead")
+            return image_aug_config["input_size"]
+        
+        # 默认值
+        rank_zero_info("Warning: No image_size found in config, using default 384")
+        return 384
+
+    def _setup_image_augmentations(self, _config):
+        """设置图像增强器，确保 image_size 一致性"""
+        # 获取图像增强配置
+        image_aug_config = _config.get("image_augmentation", {}).copy()
+        
+        # 确保图像增强配置中包含正确的 image_size
+        if "image_size" not in image_aug_config:
+            image_aug_config["image_size"] = self.image_size
+            rank_zero_info(f"Added image_size={self.image_size} to image_augmentation config")
+        elif image_aug_config["image_size"] != self.image_size:
+            rank_zero_info(f"Warning: image_augmentation.image_size ({image_aug_config['image_size']}) differs from main image_size ({self.image_size}), using main image_size")
+            image_aug_config["image_size"] = self.image_size
+        
+        # 向后兼容：如果还有 input_size，确保与 image_size 一致
+        if "input_size" in image_aug_config:
+            if image_aug_config["input_size"] != self.image_size:
+                rank_zero_info(f"Warning: Updating input_size from {image_aug_config['input_size']} to {self.image_size} for consistency")
+            image_aug_config["input_size"] = self.image_size
+        
+        # 创建训练和验证的增强器
+        self.train_image_augmentation = PathologyAugmentation(
+            config=image_aug_config,
+            is_training=True
+        )
+        
+        self.val_image_augmentation = PathologyAugmentation(
+            config=image_aug_config,
+            is_training=False
+        )
+        
+        rank_zero_info(f"Image augmentation setup:")
+        rank_zero_info(f"  - Enabled: {image_aug_config.get('enable_pathology_augmentation', True)}")
+        rank_zero_info(f"  - Image size: {self.image_size}")
+        rank_zero_info(f"  - RandStainNA: {image_aug_config.get('randstainna_enabled', False)}")
+        rank_zero_info(f"  - Multi-scale cropping: {image_aug_config.get('multi_scale_cropping', False)}")
 
     @property
     def dataset_cls(self):
@@ -133,8 +211,8 @@ class BaseDataModule(LightningDataModule):
 
     def set_train_dataset(self):
         self.train_dataset = self.dataset_cls(
-            self.data_dir,
-            self.train_transform_keys,
+            data_dir=self.data_dir,
+            image_augmentation=self.train_image_augmentation,
             split="train",
             image_size=self.image_size,
             max_text_len=self.max_text_len,
@@ -145,8 +223,8 @@ class BaseDataModule(LightningDataModule):
 
     def set_val_dataset(self):
         self.val_dataset = self.dataset_cls(
-            self.data_dir,
-            self.val_transform_keys,
+            data_dir=self.data_dir,
+            image_augmentation=self.val_image_augmentation,
             split="val",
             image_size=self.image_size,
             max_text_len=self.max_text_len,
@@ -157,8 +235,8 @@ class BaseDataModule(LightningDataModule):
 
         if hasattr(self, "dataset_cls_no_false"):
             self.val_dataset_no_false = self.dataset_cls_no_false(
-                self.data_dir,
-                self.val_transform_keys,
+                data_dir=self.data_dir,
+                image_augmentation=self.val_image_augmentation,
                 split="val",
                 image_size=self.image_size,
                 max_text_len=self.max_text_len,
@@ -169,8 +247,8 @@ class BaseDataModule(LightningDataModule):
 
     def make_no_false_val_dset(self, image_only=False):
         return self.dataset_cls_no_false(
-            self.data_dir,
-            self.val_transform_keys,
+            data_dir=self.data_dir,
+            image_augmentation=self.val_image_augmentation,
             split="val",
             image_size=self.image_size,
             max_text_len=self.max_text_len,
@@ -181,8 +259,8 @@ class BaseDataModule(LightningDataModule):
 
     def make_no_false_test_dset(self, image_only=False):
         return self.dataset_cls_no_false(
-            self.data_dir,
-            self.val_transform_keys,
+            data_dir=self.data_dir,
+            image_augmentation=self.val_image_augmentation,
             split="test",
             image_size=self.image_size,
             max_text_len=self.max_text_len,
@@ -193,8 +271,8 @@ class BaseDataModule(LightningDataModule):
 
     def set_test_dataset(self):
         self.test_dataset = self.dataset_cls(
-            self.data_dir,
-            self.val_transform_keys,
+            data_dir=self.data_dir,
+            image_augmentation=self.val_image_augmentation,
             split="test",
             image_size=self.image_size,
             max_text_len=self.max_text_len,
@@ -223,7 +301,7 @@ class BaseDataModule(LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             collate_fn=self.train_dataset.collate,
-            persistent_workers=True if self.num_workers > 0 else False  # 只有当有工作进程时才启用
+            persistent_workers=True if self.num_workers > 0 else False
         )
         return loader
 
@@ -235,7 +313,7 @@ class BaseDataModule(LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             collate_fn=self.val_dataset.collate,
-            persistent_workers=True if self.num_workers > 0 else False  # 只有当有工作进程时才启用
+            persistent_workers=True if self.num_workers > 0 else False
         )
         return loader
 

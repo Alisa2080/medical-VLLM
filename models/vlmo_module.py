@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-import pretrained_model
 from typing import Optional, Tuple, Callable, List, Dict
 import numpy as np
 from modules.Encoder import TransformerEncoder
@@ -170,138 +169,155 @@ class VLMoForTextPretraining(pl.LightningModule):
     
     def _internal_convert_vision_to_textpt(self, source_state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        将视觉预训练权重转换为文本预训练MoE架构的权重。
-        将单个MLP的权重复制到所有MoE专家中，同时保留patch_embed（包含注意力）。
-        
-        Args:
-            source_state_dict: 视觉预训练模型的状态字典
-            
-        Returns:
-            转换后的状态字典，可直接加载到当前模型
+        改进的权重转换函数：将视觉预训练权重转换为文本预训练MoE架构的权重
         """
         new_state_dict = {}
         actual_vocab_size = self.hparams.actual_vocab_size
-        rank_zero_info("VLMoForTextPretraining: Converting Vision Pretrained (single MLP) checkpoint for Text Pretraining (MoE)...")
-
-        # 统计转换信息
-        skipped_keys_count = 0
-        mapped_mlp_keys_count = 0
-        mapped_attention_keys_count = 0
-        mapped_norm_keys_count = 0
-        mapped_embedding_keys_count = 0
-        other_mapped_keys_count = 0
-
-        if not hasattr(self, 'Encoder') or not hasattr(self.Encoder, 'blocks') or not self.Encoder.blocks:
-            rank_zero_info("Error: Encoder or blocks not found in current model!")
-
-        # 获取当前模型的MoE配置信息
-        try:
-            first_block = self.Encoder.blocks[0]
-            if hasattr(first_block, 'mlp') and hasattr(first_block.mlp, 'experts'):
-                num_experts = first_block.mlp.experts
-                rank_zero_info(f"Target model has {num_experts} experts per layer")
-            else:
-                num_experts = self.config["model_arch"].get("num_experts", 4)
-                rank_zero_info(f"Using config MoE: {num_experts} experts per layer")
-        except Exception as e:
-            num_experts = self.config["model_arch"].get("num_experts", 4)
-            rank_zero_info(f"Error determining MoE structure: {e}")
-
-        for key, value in source_state_dict.items():
-            # 跳过vocab相关的权重，因为vocab_size可能不匹配
-            if "word_embeddings" in key:
-                source_vocab_size = value.shape[0] if len(value.shape) > 0 else 0
-                if source_vocab_size != actual_vocab_size:
-                    rank_zero_info(f"Skipping {key}: source vocab_size={source_vocab_size}, target vocab_size={actual_vocab_size}")
-                    skipped_keys_count += 1
-                    continue
-                else:
-                    rank_zero_info(f"Mapping {key}: vocab sizes match ({actual_vocab_size})")
-                    new_state_dict[key] = value
-                    mapped_embedding_keys_count += 1
-                    continue
+        
+        rank_zero_info("VLMoForTextPretraining: Converting Vision Pretrained checkpoint for Text Pretraining (MoE)...")
+        rank_zero_info(f"Using config MoE: {self.config.get('model_arch', {}).get('num_experts', 4)} experts per layer")
+        
+        # 统计信息
+        stats = {
+            'mlp_converted': 0,
+            'attention_mapped': 0, 
+            'norm_mapped': 0,
+            'embedding_mapped': 0,
+            'other_mapped': 0,
+            'skipped': 0,
+            'unhandled': 0
+        }
+        
+        # 获取目标模型的状态字典键名，用于验证兼容性
+        target_model_keys = set(self.Encoder.state_dict().keys())
+        
+        # 获取MoE配置
+        num_experts = self.config.get('model_arch', {}).get('num_experts', 4)
+        
+        for orig_key, value in source_state_dict.items():
+            processed = False
             
-            # 跳过其他可能依赖vocab_size的组件
-            if any(vocab_key in key for vocab_key in ["mlm_score", "lm_head", "predictions", "classifier"]):
-                # 检查是否是vocab相关的权重
-                if len(value.shape) > 0 and value.shape[0] == actual_vocab_size:
-                    rank_zero_info(f"Mapping vocab-related {key}: shapes compatible")
-                    new_state_dict[key] = value
-                    mapped_embedding_keys_count += 1
-                elif len(value.shape) > 0 and value.shape[-1] == actual_vocab_size:
-                    rank_zero_info(f"Mapping vocab-related {key}: output dim compatible")
-                    new_state_dict[key] = value
-                    mapped_embedding_keys_count += 1
-                else:
-                    rank_zero_info(f"Skipping {key}: shape {value.shape} not compatible with dynamic vocab_size={actual_vocab_size}")
-                    skipped_keys_count += 1
+            # 1. 跳过不相关的键
+            if self._should_skip_key(orig_key, actual_vocab_size):
+                rank_zero_info(f"Skipping {orig_key}: {'vocab size mismatch' if 'lm_head' in orig_key else 'not relevant for text pretraining'}")
+                stats['skipped'] += 1
                 continue
-            
-            # 处理MLP -> MoE转换
-            if ".mlp." in key and "experts" not in key:
-                # 这是单个MLP的权重，需要复制到所有专家
-                layer_match = None
-                for i in range(len(self.Encoder.blocks)):
-                    if f".blocks.{i}.mlp." in key:
-                        layer_match = i
-                        break
                 
-                if layer_match is not None:
-                    # 提取MLP权重类型（如fc1.weight, fc2.weight等）
-                    mlp_weight_name = key.split(f".blocks.{layer_match}.mlp.")[-1]
+            # 2. 去除 model.encoder. 前缀
+            if orig_key.startswith("model.encoder."):
+                new_key = orig_key[len("model.encoder."):]
+            else:
+                rank_zero_info(f"Unhandled key: {orig_key}")
+                stats['unhandled'] += 1
+                continue
+            
+            # 3. 处理 MLP 到 MoE 的转换
+            if self._is_mlp_weight(new_key):
+                if self._convert_mlp_to_moe(new_key, value, new_state_dict, num_experts):
+                    stats['mlp_converted'] += 1
+                    processed = True
+            
+            # 4. 直接映射兼容的权重
+            if not processed and new_key in target_model_keys:
+                if self._shapes_compatible(value, target_model_keys, new_key):
+                    new_state_dict[new_key] = value
+                    processed = True
                     
-                    # 复制到所有专家
-                    for expert_idx in range(num_experts):
-                        new_key = key.replace(f".blocks.{layer_match}.mlp.", f".blocks.{layer_match}.mlp.experts.{expert_idx}.")
-                        new_state_dict[new_key] = value.clone()
-                        mapped_mlp_keys_count += 1
-                    
-                    rank_zero_info(f"Converted MLP {key} to {num_experts} experts")
-                    continue
+                    # 分类统计
+                    if 'attn.' in new_key or 'attention.' in new_key:
+                        stats['attention_mapped'] += 1
+                    elif any(norm_pattern in new_key for norm_pattern in ['norm.', 'layernorm.']):
+                        stats['norm_mapped'] += 1
+                    elif any(embed_pattern in new_key for embed_pattern in ['embed', 'token']):
+                        stats['embedding_mapped'] += 1
+                    else:
+                        stats['other_mapped'] += 1
             
-            # 处理注意力层权重
-            if any(attn_key in key for attn_key in [".attn.", ".attention.", ".self_attn."]):
-                new_state_dict[key] = value
-                mapped_attention_keys_count += 1
-                continue
-            
-            # 处理归一化层权重
-            if any(norm_key in key for norm_key in [".norm.", ".layernorm.", ".layer_norm."]):
-                new_state_dict[key] = value
-                mapped_norm_keys_count += 1
-                continue
-            
-            # 处理token type embeddings
-            if "token_type_embeddings" in key:
-                new_state_dict[key] = value
-                mapped_embedding_keys_count += 1
-                continue
-            
-            # 处理其他权重（patch_embed, cls_token, position embeddings等）
-            if any(other_key in key for other_key in ["patch_embed", "cls_token", "pos_embed", "rope"]):
-                new_state_dict[key] = value
-                other_mapped_keys_count += 1
-                continue
-            
-            # 跳过MLM相关的权重（这些是新任务特定的）
-            if any(skip_key in key for skip_key in ["mlm_score", "classifier", "pooler"]):
-                rank_zero_info(f"Skipping task-specific weight: {key}")
-                skipped_keys_count += 1
-                continue
-            
-            # 其他未匹配的权重
-            rank_zero_info(f"Unhandled key: {key}")
-            skipped_keys_count += 1
-
-        rank_zero_info(f"Conversion summary:")
-        rank_zero_info(f"  - MLP layers converted to MoE: {mapped_mlp_keys_count}")
-        rank_zero_info(f"  - Attention layers mapped: {mapped_attention_keys_count}")
-        rank_zero_info(f"  - Norm layers mapped: {mapped_norm_keys_count}")
-        rank_zero_info(f"  - Embedding layers mapped: {mapped_embedding_keys_count}")
-        rank_zero_info(f"  - Other keys mapped: {other_mapped_keys_count}")
-        rank_zero_info(f"  - Keys skipped: {skipped_keys_count}")
+            # 5. 记录未处理的键
+            if not processed:
+                rank_zero_info(f"Unhandled key: {orig_key}")
+                stats['unhandled'] += 1
+        
+        # 输出转换统计
+        self._log_conversion_stats(stats)
         
         return new_state_dict
+    
+    def _should_skip_key(self, key: str, vocab_size: int) -> bool:
+        """判断是否应该跳过某个键"""
+        skip_patterns = [
+            "model.mil_aggregator.",  # MIL聚合器
+            "model.encoder.lm_head.",  # 词汇表不匹配的LM头
+        ]
+        
+        # 检查是否匹配跳过模式
+        for pattern in skip_patterns:
+            if key.startswith(pattern):
+                return True
+        
+        # 特殊处理：检查lm_head的词汇表大小
+        if "lm_head." in key and "model.encoder.lm_head." in key:
+            if key.endswith(".weight"):
+                expected_shape = (vocab_size, self.embed_dim)
+                if hasattr(self, '_temp_value_shape'):
+                    return self._temp_value_shape[0] != vocab_size
+            elif key.endswith(".bias"):
+                return True  # 如果权重不匹配，偏置也跳过
+        
+        return False
+    
+    def _is_mlp_weight(self, key: str) -> bool:
+        """判断是否是MLP层的权重"""
+        mlp_patterns = [
+            ".mlp.gate_proj.",
+            ".mlp.up_proj.", 
+            ".mlp.down_proj."
+        ]
+        return any(pattern in key for pattern in mlp_patterns)
+    
+    def _convert_mlp_to_moe(self, key: str, value: torch.Tensor, new_state_dict: dict, num_experts: int) -> bool:
+        """将MLP权重转换为MoE权重"""
+        try:
+            # 解析层号和权重类型
+            # 例如: blocks.0.mlp.gate_proj.weight -> layer=0, weight_type=gate_proj.weight
+            parts = key.split('.')
+            if len(parts) < 4 or parts[2] != 'mlp':
+                return False
+                
+            layer_idx = parts[1]
+            weight_type = '.'.join(parts[3:])  # gate_proj.weight, up_proj.weight, etc.
+            
+            # 为每个专家复制权重
+            for expert_idx in range(num_experts):
+                expert_key = f"blocks.{layer_idx}.moe_block.experts.{expert_idx}.{weight_type}"
+                new_state_dict[expert_key] = value.clone()
+            
+            rank_zero_info(f"Converted MLP {key} to {num_experts} experts")
+            return True
+            
+        except Exception as e:
+            rank_zero_info(f"Failed to convert MLP weight {key}: {e}")
+            return False
+    
+    def _shapes_compatible(self, value: torch.Tensor, target_keys: set, key: str) -> bool:
+        """检查形状是否兼容"""
+        if key not in target_keys:
+            return False
+        
+        # 获取目标模型中对应参数的形状
+        target_param = self.Encoder.state_dict()[key]
+        return value.shape == target_param.shape
+    
+    def _log_conversion_stats(self, stats: dict):
+        """记录转换统计信息"""
+        rank_zero_info("Conversion summary:")
+        rank_zero_info(f"  - MLP layers converted to MoE: {stats['mlp_converted']}")
+        rank_zero_info(f"  - Attention layers mapped: {stats['attention_mapped']}")
+        rank_zero_info(f"  - Norm layers mapped: {stats['norm_mapped']}")
+        rank_zero_info(f"  - Embedding layers mapped: {stats['embedding_mapped']}")
+        rank_zero_info(f"  - Other keys mapped: {stats['other_mapped']}")
+        rank_zero_info(f"  - Keys skipped: {stats['skipped']}")
+        rank_zero_info(f"  - Keys unhandled: {stats['unhandled']}")
         
     
     def setup_stage_weights_and_freezing(self):
@@ -451,22 +467,26 @@ class VLMoForTextPretraining(pl.LightningModule):
             router_logits_tuple = getattr(encoder_outputs_obj, "router_probs", None) 
             if router_logits_tuple is not None and len(router_logits_tuple) > 0:
                 moe_aux_loss = self.compute_moe_aux_loss_from_router_logits(router_logits_tuple)
-        
+    
         total_loss = mlm_loss + moe_aux_loss
 
         self.log("train/mlm_loss", mlm_loss, prog_bar=False, logger=True, sync_dist=True)
         self.log("train/moe_aux_loss", moe_aux_loss, prog_bar=False, logger=True, sync_dist=True)
         self.log("train/total_loss", total_loss, prog_bar=True, logger=True, sync_dist=True)
 
-        acc_metric = getattr(self, f"train_textmlm_accuracy", None) # from set_metrics
+        # 修复：正确记录训练准确率指标
+        acc_metric = getattr(self, f"train_{vlmo_utils.TEXT_PRETRAIN_METRIC_NAME}", None)
         if acc_metric:
             preds = mlm_logits.argmax(dim=-1)
             mask = mlm_labels != -100
             if mask.sum() > 0:
-                 acc_metric.update(preds[mask], mlm_labels[mask])
+                acc_metric.update(preds[mask], mlm_labels[mask])
+                # 关键修复：记录指标对象到 Lightning 系统
+                self.log(f"train/{vlmo_utils.TEXT_PRETRAIN_METRIC_NAME}", acc_metric, 
+                    prog_bar=True, logger=True, sync_dist=True, on_step=False, on_epoch=True)
 
         return total_loss
-    
+
     def validation_step(self, batch, batch_idx):
         self.current_batch_size = batch["text_ids_mlm"].size(0)
         outputs = self.forward(batch)
@@ -478,7 +498,7 @@ class VLMoForTextPretraining(pl.LightningModule):
             mlm_labels.reshape(-1),
             ignore_index=-100,
         )
-    
+
         moe_aux_loss = torch.tensor(0.0, device=mlm_loss.device)
         encoder_outputs_obj = outputs.get("encoder_outputs_obj")
         if encoder_outputs_obj is not None:
@@ -492,14 +512,17 @@ class VLMoForTextPretraining(pl.LightningModule):
         self.log("val/moe_aux_loss", moe_aux_loss, prog_bar=False, logger=True, sync_dist=True)
         self.log("val/total_loss", total_loss, prog_bar=True, logger=True, sync_dist=True)
 
+        # 修复：正确记录验证准确率指标
         acc_metric = getattr(self, f"val_{vlmo_utils.TEXT_PRETRAIN_METRIC_NAME}", None)
-        
         if acc_metric:
             preds = mlm_logits.argmax(dim=-1)
             mask = mlm_labels != -100
             if mask.sum() > 0:
-                 acc_metric.update(preds[mask], mlm_labels[mask])
-        
+                acc_metric.update(preds[mask], mlm_labels[mask])
+                # 关键修复：记录指标对象到 Lightning 系统
+                self.log(f"val/{vlmo_utils.TEXT_PRETRAIN_METRIC_NAME}", acc_metric, 
+                    prog_bar=True, logger=True, sync_dist=True, on_step=False, on_epoch=True)
+    
         return total_loss
     
     def on_validation_epoch_end(self):
@@ -1055,44 +1078,41 @@ class VLMoForVisionLanguagePretraining(pl.LightningModule):
         """记录准确率指标"""
         # ITC准确率
         if "itc_logits_i2t" in outputs and "itc_logits_t2i" in outputs:
-            itc_i2t_logits = outputs["itc_logits_i2t"]
-            itc_t2i_logits = outputs["itc_logits_t2i"]
-            
-            # 计算准确率
-            labels = torch.arange(itc_i2t_logits.size(0), device=itc_i2t_logits.device)
-            
-            i2t_preds = itc_i2t_logits.argmax(dim=-1)
-            t2i_preds = itc_t2i_logits.argmax(dim=-1)
-            
-            # 更新指标
-            i2t_metric = getattr(self, f"{phase}_{vlmo_utils.VL_PRETRAIN_ITC_I2T_METRIC_NAME}", None)
-            t2i_metric = getattr(self, f"{phase}_{vlmo_utils.VL_PRETRAIN_ITC_T2I_METRIC_NAME}", None)
-            
-            if i2t_metric:
-                i2t_metric.update(i2t_preds, labels)
-                self.log(f"{phase}/{vlmo_utils.VL_PRETRAIN_ITC_I2T_METRIC_NAME}", i2t_metric, 
-                        prog_bar=False, logger=True, on_step=False, on_epoch=True)
-            
-            if t2i_metric:
-                t2i_metric.update(t2i_preds, labels)
-                self.log(f"{phase}/{vlmo_utils.VL_PRETRAIN_ITC_T2I_METRIC_NAME}", t2i_metric,
-                        prog_bar=False, logger=True, on_step=False, on_epoch=True)
+            # 获取地面真实标签
+            batch_size = outputs["itc_logits_i2t"].size(0)
+            labels = torch.arange(batch_size, device=outputs["itc_logits_i2t"].device)
         
+            # I2T准确率
+            i2t_acc_metric = getattr(self, f"{phase}_{vlmo_utils.VL_PRETRAIN_ITC_I2T_METRIC_NAME}", None)
+            if i2t_acc_metric:
+                i2t_preds = outputs["itc_logits_i2t"].argmax(dim=-1)
+                i2t_acc_metric.update(i2t_preds, labels)
+                # 关键修复：记录指标对象
+                self.log(f"{phase}/{vlmo_utils.VL_PRETRAIN_ITC_I2T_METRIC_NAME}", i2t_acc_metric,
+                    prog_bar=True, logger=True, sync_dist=True, on_step=False, on_epoch=True)
+        
+            # T2I准确率
+            t2i_acc_metric = getattr(self, f"{phase}_{vlmo_utils.VL_PRETRAIN_ITC_T2I_METRIC_NAME}", None)
+            if t2i_acc_metric:
+                t2i_preds = outputs["itc_logits_t2i"].argmax(dim=-1)
+                t2i_acc_metric.update(t2i_preds, labels)
+                # 关键修复：记录指标对象
+                self.log(f"{phase}/{vlmo_utils.VL_PRETRAIN_ITC_T2I_METRIC_NAME}", t2i_acc_metric,
+                    prog_bar=True, logger=True, sync_dist=True, on_step=False, on_epoch=True)
+    
         # 交叉模态MLM准确率
-        if "cross_modal_mlm_logits" in outputs and "text_labels" in outputs:
-            cross_modal_mlm_logits = outputs["cross_modal_mlm_logits"]
-            mlm_labels = outputs["text_labels"]
-            
-            if mlm_labels is not None:
-                cross_modal_preds = cross_modal_mlm_logits.argmax(dim=-1)
+        if "cross_modal_mlm_logits" in outputs and "cross_modal_mlm_labels" in outputs:
+            mlm_acc_metric = getattr(self, f"{phase}_{vlmo_utils.VL_PRETRAIN_CROSS_MODAL_MLM_METRIC_NAME}", None)
+            if mlm_acc_metric:
+                mlm_logits = outputs["cross_modal_mlm_logits"]
+                mlm_labels = outputs["cross_modal_mlm_labels"]
+                mlm_preds = mlm_logits.argmax(dim=-1)
                 mask = mlm_labels != -100
-                
                 if mask.sum() > 0:
-                    cross_modal_metric = getattr(self, f"{phase}_{vlmo_utils.VL_PRETRAIN_CROSS_MODAL_MLM_METRIC_NAME}", None)
-                    if cross_modal_metric:
-                        cross_modal_metric.update(cross_modal_preds[mask], mlm_labels[mask])
-                        self.log(f"{phase}/{vlmo_utils.VL_PRETRAIN_CROSS_MODAL_MLM_METRIC_NAME}", cross_modal_metric,
-                                prog_bar=False, logger=True, on_step=False, on_epoch=True)
+                    mlm_acc_metric.update(mlm_preds[mask], mlm_labels[mask])
+                    # 关键修复：记录指标对象
+                    self.log(f"{phase}/{vlmo_utils.VL_PRETRAIN_CROSS_MODAL_MLM_METRIC_NAME}", mlm_acc_metric,
+                        prog_bar=True, logger=True, sync_dist=True, on_step=False, on_epoch=True)
 
     def on_validation_epoch_end(self):
         """验证周期结束时的处理"""
